@@ -97,5 +97,5 @@ export async function fetchZones(baseUrl: string, radarId: string) {
 }
 
 export async function fetchEvents(baseUrl: string, limit = 50) {
-  return request<{events: EventRow[]}>(normalizeBase(baseUrl), `/events?limit=${limit}`);
+  return request<EventRow[]>(normalizeBase(baseUrl), `/events?limit=${limit}`);
 }

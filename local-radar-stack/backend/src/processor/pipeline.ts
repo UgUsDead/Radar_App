@@ -464,7 +464,7 @@ export class RadarPipeline {
 
     const { rows } = await this.repository.pool.query(
       `SELECT d.owner_id, d.room_id, r.name as room_name, d.metadata as device_metadata, 
-              r.metadata as room_metadata, p.id as patient_id, p.name as patient_name
+              r.metadata as room_metadata, p.id as patient_id, p.name as patient_name, p.metadata as patient_metadata
        FROM radar_devices d
        LEFT JOIN rooms r ON r.id = d.room_id
        LEFT JOIN patients p ON p.room_id = d.room_id
@@ -474,10 +474,10 @@ export class RadarPipeline {
 
     const ownerId = rows.length > 0 && rows[0].owner_id !== null ? Number(rows[0].owner_id) : null;
     const isAssigned = ownerId !== null && rows.length > 0 && rows[0].room_id !== null;
-    const deviceMetadata = rows.length > 0 ? asRecord(rows[0].device_metadata) : {};
+    const patientMetadata = rows.length > 0 ? asRecord(rows[0].patient_metadata) : {};
     const roomMetadata = rows.length > 0 ? asRecord(rows[0].room_metadata) : {};
 
-    const profile = riskProfileService.getRiskProfile(deviceMetadata);
+    const profile = riskProfileService.getRiskProfile(patientMetadata);
     
     // Use radarHeight from room metadata, default to 2.5
     const radarHeightMeters = Number(roomMetadata.radarHeightMeters) || 2.5;

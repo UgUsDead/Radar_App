@@ -11,7 +11,7 @@ import MQTT from 'sp-react-native-mqtt';
 import {MQTT_KEEPALIVE} from '../constants';
 
 export interface MQTTCallbacks {
-  onConnect: (brokerIP: string) => void;
+  onConnect: (brokerUri: string) => void;
   onDisconnect: () => void;
   onError: (err: string) => void;
   onTelemetry: (radarId: string, data: any) => void;
@@ -32,7 +32,7 @@ export interface MQTTConnectOptions {
 
 export class MQTTClient {
   private client: any = null;
-  private brokerIP: string = '';
+  private brokerUri: string = '';
   private callbacks: MQTTCallbacks;
 
   constructor(callbacks: MQTTCallbacks) {
@@ -44,14 +44,18 @@ export class MQTTClient {
   }
 
   get currentBrokerIP(): string {
-    return this.brokerIP;
+    return this.brokerUri;
   }
 
-  async connect(brokerIP: string, options?: MQTTConnectOptions): Promise<void> {
+  async connect(brokerUriOrHost: string, options?: MQTTConnectOptions): Promise<void> {
     // Disconnect existing if any
     this.disconnect();
 
-    this.brokerIP = brokerIP;
+    const brokerUri = /^\w+:\/\//.test(brokerUriOrHost)
+      ? brokerUriOrHost.trim()
+      : `mqtt://${brokerUriOrHost.trim()}`;
+
+    this.brokerUri = brokerUri;
     const clientId =
       'RadarApp-' + Date.now().toString(16) + '-' + Math.random().toString(16).substr(2, 5);
     const reconnect = options?.reconnect ?? true;
@@ -59,7 +63,7 @@ export class MQTTClient {
 
     try {
       const client = await MQTT.createClient({
-        uri: `mqtt://${brokerIP}:1883`,
+        uri: brokerUri,
         clientId,
         keepalive: MQTT_KEEPALIVE,
         clean: true,
@@ -118,7 +122,7 @@ export class MQTTClient {
           client.subscribe('linovt/+/radar/config/state', 0);
           client.subscribe('linovt/+/cmd/status', 0);
           client.subscribe('linovt/+/radar/cmd/status', 0);
-          this.callbacks.onConnect(brokerIP);
+          this.callbacks.onConnect(brokerUri);
           settleResolve();
         });
 

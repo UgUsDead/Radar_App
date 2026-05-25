@@ -132,15 +132,15 @@ const ProvisioningScreen: React.FC<ProvisioningScreenProps> = ({
 
             <View style={styles.manualBrokerSection}>
               <Text style={styles.savedRadarsTitle}>
-                Direct MQTT Broker IP
+                Direct MQTT Broker URI
               </Text>
               <TextInput
                 style={[styles.formInput, {marginBottom: 10}]}
-                placeholder="10.153.58.198"
+                placeholder="mqtt://broker-host:1883"
                 placeholderTextColor="#555"
                 value={manualBrokerIP}
                 onChangeText={setManualBrokerIP}
-                keyboardType="numeric"
+                keyboardType="url"
                 autoCapitalize="none"
                 autoCorrect={false}
               />
@@ -355,11 +355,11 @@ const ProvisioningScreen: React.FC<ProvisioningScreenProps> = ({
             <Text style={styles.formLabel}>MQTT Broker URI</Text>
             <Text style={styles.fieldHelpText}>
               URI do broker MQTT para o dispositivo se conectar após provisioning.
-              Exemplo: mqtt://10.10.128.50:1883
+              Exemplo: mqtt://broker-host:1883
             </Text>
             <TextInput
               style={styles.formInput}
-              placeholder="mqtt://10.10.128.50:1883"
+              placeholder="mqtt://broker-host:1883"
               placeholderTextColor="#555"
               value={mqttBrokerURI}
               onChangeText={setMqttBrokerURI}

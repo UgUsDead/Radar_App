@@ -7,7 +7,7 @@
  */
 
 import NetInfo from '@react-native-community/netinfo';
-import {MANUAL_BROKER_CANDIDATES, STATIC_SUBNETS, FALLBACK_IPS} from '../constants';
+import {STATIC_SUBNETS} from '../constants';
 
 export interface BrokerDiscoveryOptions {
   maxCandidates?: number;
@@ -44,10 +44,6 @@ function buildCandidates(
 
   addUnique(candidates, extractIPv4(preferredIP));
 
-  for (const ip of MANUAL_BROKER_CANDIDATES) {
-    addUnique(candidates, extractIPv4(ip));
-  }
-
   const dynamicSubnets: string[] = [];
   if (gatewayIP) dynamicSubnets.push(subnet(gatewayIP));
   if (localIP) dynamicSubnets.push(subnet(localIP));
@@ -62,12 +58,6 @@ function buildCandidates(
     addUnique(candidates, `${base}.100`);
     addUnique(candidates, `${base}.1`);
     addUnique(candidates, `${base}.2`);
-  }
-
-  if (includeStaticFallbacks) {
-    for (const ip of FALLBACK_IPS) {
-      addUnique(candidates, extractIPv4(ip));
-    }
   }
 
   return candidates.slice(0, maxCandidates);

@@ -608,7 +608,7 @@ export const SetupFlow: React.FC<SetupFlowProps> = ({ visible, onClose, initialA
             style={styles.input}
             value={apiBase}
             onChangeText={setApiBase}
-            placeholder="http://10.0.0.1:4000"
+            placeholder="http://backend-host:4000"
             autoCapitalize="none"
           />
           <View style={styles.actionsRow}>

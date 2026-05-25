@@ -68,7 +68,7 @@ const LoginScreen: React.FC<LoginScreenProps> = ({ onLoginSuccess, initialApiBas
                 style={styles.input}
                 value={apiBase}
                 onChangeText={setApiBase}
-                placeholder="Ex: http://10.0.0.1:4000"
+                placeholder="Ex: http://backend-host:4000"
                 placeholderTextColor="#666"
                 autoCapitalize="none"
               />

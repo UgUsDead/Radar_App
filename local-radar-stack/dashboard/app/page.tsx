@@ -116,6 +116,12 @@ export default function HomePage() {
     requestConfigState, resetApplyState,
   } = useDeviceControl(selectedControlRadarId);
 
+  useEffect(() => {
+    if (!selectedControlRadarId && knownRadarIds.length > 0) {
+      setSelectedControlRadarId(knownRadarIds[0]);
+    }
+  }, [knownRadarIds, selectedControlRadarId]);
+
   const [clearingDatabase, setClearingDatabase] = useState(false);
   const [managementMessage, setManagementMessage] = useState("");
   const zoneEditorRef = useRef<HTMLDivElement>(null);

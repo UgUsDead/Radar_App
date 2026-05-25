@@ -12,7 +12,7 @@ const schema = z.object({
   MQTT_USERNAME: z.string().optional(),
   MQTT_PASSWORD: z.string().optional(),
   MQTT_CLIENT_ID: z.string().default("radar-backend"),
-  MQTT_TOPIC: z.string().default("inovt/+/telemetry"),
+  MQTT_TOPIC: z.string().default("linovt/+/telemetry"),
   MQTT_RECONNECT_PERIOD_MS: z.coerce.number().default(2000),
   RADAR_OFFLINE_SECONDS: z.coerce.number().default(20),
 

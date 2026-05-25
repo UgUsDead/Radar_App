@@ -69,19 +69,31 @@ export function RoomsBoardSection({
 
               <div className="room-line">
                 <strong>Estado de Segurança:</strong> 
-                <span className={`ml-2 px-2 py-0.5 rounded text-xs font-bold uppercase ${
-                  room.safety_state === 'urgent' ? 'bg-red-200 text-red-800' :
-                  room.safety_state === 'watch' ? 'bg-yellow-200 text-yellow-800' :
-                  room.safety_state === 'offline' ? 'bg-gray-200 text-gray-800' :
-                  'bg-green-200 text-green-800'
-                }`}>
+                <span style={{
+                  marginLeft: "0.5rem",
+                  padding: "0.125rem 0.5rem",
+                  borderRadius: "0.25rem",
+                  fontSize: "0.75rem",
+                  fontWeight: "bold",
+                  textTransform: "uppercase",
+                  backgroundColor: 
+                    room.safety_state === 'urgent' ? '#fee2e2' :
+                    room.safety_state === 'watch' ? '#fef3c7' :
+                    room.safety_state === 'offline' ? '#e5e7eb' :
+                    '#d1fae5',
+                  color: 
+                    room.safety_state === 'urgent' ? '#991b1b' :
+                    room.safety_state === 'watch' ? '#92400e' :
+                    room.safety_state === 'offline' ? '#374151' :
+                    '#065f46'
+                }}>
                   {room.safety_state || 'normal'}
                 </span>
               </div>
               {room.safety_state !== 'offline' && typeof room.occupancy !== 'undefined' && (
                 <div className="room-line">
                   <strong>Ocupação:</strong> {room.occupancy}
-                  <span className="text-gray-500 text-xs ml-2">
+                  <span style={{ color: "#6b7280", fontSize: "0.75rem", marginLeft: "0.5rem" }}>
                      (Inativo: {room.last_activity_sec ? Math.round(room.last_activity_sec) : 0}s)
                   </span>
                 </div>

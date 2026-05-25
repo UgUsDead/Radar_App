@@ -101,7 +101,7 @@ export const RADAR_CONFIG_LIMITS = {
 export const DEFAULT_RADAR_CONFIG: RadarConfig = {
   schema: 1,
   profile: "aop_6m_static_retention",
-  applyMode: "restart",
+  applyMode: "runtime",
   mount: {
     heightM: 2.0,
     azimuthTiltDeg: 0.0,

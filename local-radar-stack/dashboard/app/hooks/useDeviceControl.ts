@@ -16,11 +16,20 @@ import { DEFAULT_RADAR_CONFIG } from "../types/radarConfig";
 export function useDeviceControl(deviceId: string) {
   const [deviceState, setDeviceState] = useState<DeviceState | null>(null);
   const [logs, setLogs] = useState<any[]>([]);
-  const [radarConfig, setRadarConfig] = useState<RadarConfig>({ ...DEFAULT_RADAR_CONFIG });
+  const [radarConfig, setRadarConfigState] = useState<RadarConfig>({ ...DEFAULT_RADAR_CONFIG });
   const [configApplyState, setConfigApplyState] = useState<ConfigApplyState>("idle");
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
+  const configDraftDirtyRef = useRef(false);
   const prevConfigStatusRef = useRef<string | null>(null);
+
+  const setRadarConfig = useCallback<React.Dispatch<React.SetStateAction<RadarConfig>>>((next) => {
+    configDraftDirtyRef.current = true;
+    // Reset apply state when user makes changes
+    setConfigApplyState("idle");
+    setMessage("");
+    setRadarConfigState((prev) => (typeof next === "function" ? (next as (prevState: RadarConfig) => RadarConfig)(prev) : next));
+  }, []);
 
   // ── Poll device state ──────────────────────────────────
   const fetchDeviceState = useCallback(async () => {
@@ -45,7 +54,7 @@ export function useDeviceControl(deviceId: string) {
           setConfigApplyState("failed");
           setMessage("Falha ao aplicar configuração. Verifique o dispositivo.");
         } else if (newStatus.startsWith("rejected")) {
-          setConfigApplyState("rejected");
+          setConfigApplyState("failed");
           setMessage(`Configuração rejeitada: ${newStatus}`);
         } else if (newStatus === "state_published" || newStatus === "default_config_active_or_no_stored_config") {
           // Not an apply state, just informational
@@ -53,8 +62,8 @@ export function useDeviceControl(deviceId: string) {
       }
 
       // Populate form from retained config state if available
-      if (data.radarConfigState && configApplyState === "idle") {
-        setRadarConfig(prev => ({
+      if (data.radarConfigState && configApplyState === "idle" && !configDraftDirtyRef.current) {
+        setRadarConfigState(prev => ({
           ...DEFAULT_RADAR_CONFIG,
           ...data.radarConfigState as any,
           mount: { ...DEFAULT_RADAR_CONFIG.mount, ...(data.radarConfigState as any)?.mount },
@@ -69,6 +78,7 @@ export function useDeviceControl(deviceId: string) {
           timing: { ...DEFAULT_RADAR_CONFIG.timing, ...(data.radarConfigState as any)?.timing },
         }));
       }
+
     } catch {
       // Silently fail polling
     }
@@ -109,7 +119,8 @@ export function useDeviceControl(deviceId: string) {
     setConfigApplyState("idle");
     setMessage("");
     prevConfigStatusRef.current = null;
-    setRadarConfig({ ...DEFAULT_RADAR_CONFIG });
+    configDraftDirtyRef.current = false;
+    setRadarConfigState({ ...DEFAULT_RADAR_CONFIG });
   }, [deviceId]);
 
   // ── Send device command ────────────────────────────────
@@ -156,18 +167,26 @@ export function useDeviceControl(deviceId: string) {
 
   // ── Apply radar config ─────────────────────────────────
   const applyRadarConfig = useCallback(async () => {
-    if (!deviceId) return;
+    console.log("[DEBUG] applyRadarConfig triggered. deviceId:", deviceId, "config:", radarConfig);
+    if (!deviceId) {
+      console.warn("[DEBUG] applyRadarConfig: no deviceId");
+      return;
+    }
     setLoading(true);
     setConfigApplyState("publishing");
     setMessage("A enviar configuração...");
     prevConfigStatusRef.current = null;
     try {
-      const res = await apiFetch(`/devices/${encodeURIComponent(deviceId)}/radar/config`, {
-        method: "PUT",
+      const url = `/devices/${encodeURIComponent(deviceId)}/radar/config`;
+      console.log("[DEBUG] applyRadarConfig: POSTING to", url);
+      const res = await apiFetch(url, {
+        method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(radarConfig),
       });
+      console.log("[DEBUG] applyRadarConfig: response status:", res.status);
       const data = await res.json();
+      console.log("[DEBUG] applyRadarConfig: response data:", data);
       if (!res.ok) {
         setConfigApplyState("rejected");
         throw new Error(data.error || "Falha ao enviar configuração");
@@ -175,8 +194,9 @@ export function useDeviceControl(deviceId: string) {
       setConfigApplyState("applying");
       setMessage("Configuração enviada. A aguardar resposta do dispositivo...");
     } catch (err) {
+      console.error("[DEBUG] applyRadarConfig error:", err);
       setMessage(err instanceof Error ? err.message : "Erro ao enviar configuração");
-      if (configApplyState !== "rejected") setConfigApplyState("failed");
+      setConfigApplyState("failed");
     } finally {
       setLoading(false);
     }
@@ -184,18 +204,24 @@ export function useDeviceControl(deviceId: string) {
 
   // ── Request stored config ──────────────────────────────
   const requestConfigState = useCallback(async () => {
+    console.log("[DEBUG] requestConfigState triggered. deviceId:", deviceId);
     if (!deviceId) return;
     setMessage("A solicitar configuração armazenada...");
     try {
-      const res = await apiFetch(`/devices/${encodeURIComponent(deviceId)}/radar/config/get`, {
+      const url = `/devices/${encodeURIComponent(deviceId)}/radar/config/get`;
+      console.log("[DEBUG] requestConfigState: POSTING to", url);
+      const res = await apiFetch(url, {
         method: "POST",
       });
+      console.log("[DEBUG] requestConfigState: response status:", res.status);
       if (!res.ok) {
         const data = await res.json();
+        console.error("[DEBUG] requestConfigState fail data:", data);
         throw new Error(data.error || "Falha");
       }
       setMessage("Pedido enviado. A configuração será recebida em breve.");
     } catch (err) {
+      console.error("[DEBUG] requestConfigState error:", err);
       setMessage(err instanceof Error ? err.message : "Erro");
     }
   }, [deviceId]);

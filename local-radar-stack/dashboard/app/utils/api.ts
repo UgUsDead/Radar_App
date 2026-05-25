@@ -10,7 +10,20 @@ export async function apiFetch(endpoint: string, options: RequestInit = {}) {
     headers["Authorization"] = `Bearer ${token}`;
   }
 
-  const response = await fetch(`${apiBase}${endpoint}`, {
+  const url = `${apiBase}${endpoint}`;
+  let bodyDebug: any = "";
+  if (options.body && typeof options.body === "string") {
+    try {
+      bodyDebug = JSON.parse(options.body);
+    } catch {
+      bodyDebug = options.body;
+    }
+  } else if (options.body) {
+    bodyDebug = "[Non-string body]";
+  }
+  console.debug(`[API] ${options.method || "GET"} ${url}`, bodyDebug);
+
+  const response = await fetch(url, {
     ...options,
     headers
   });

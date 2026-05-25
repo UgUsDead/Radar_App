@@ -234,8 +234,7 @@ export function createDeviceCommandRouter(deps: DeviceCommandRouterDeps): expres
     });
   });
 
-  // ── PUT /devices/:id/radar/config — Publish radar config to device ─────
-  router.put("/devices/:id/radar/config", (req, res) => {
+  const publishRadarConfig = (req: express.Request, res: express.Response) => {
     const deviceId = req.params.id;
     const configPayload = req.body;
 
@@ -247,21 +246,29 @@ export function createDeviceCommandRouter(deps: DeviceCommandRouterDeps): expres
     // Validate against firmware limits
     const validationError = validateRadarConfig(configPayload);
     if (validationError) {
+      logger.warn({ deviceId, validationError, configPayload }, "Radar config validation failed");
       res.status(400).json({ error: validationError });
       return;
     }
 
     if (!mqttClient.isConnected()) {
+      logger.error({ deviceId, topic: `linovt/${deviceId}/radar/config/set` }, "Cannot publish radar config: MQTT not connected");
       res.status(503).json({ error: "MQTT not connected" });
       return;
     }
 
     const topic = `linovt/${deviceId}/radar/config/set`;
     const payload = JSON.stringify(configPayload);
+    
+    logger.info({ deviceId, topic, payload: configPayload }, "Publishing radar config to MQTT");
+    
     mqttClient.publish(topic, payload);
-    logger.info({ deviceId, topic, payloadSize: payload.length }, "Radar config published");
     res.json({ ok: true, deviceId, topic, status: "published" });
-  });
+  };
+
+  // ── PUT/POST /devices/:id/radar/config — Publish radar config to device ─────
+  router.put("/devices/:id/radar/config", publishRadarConfig);
+  router.post("/devices/:id/radar/config", publishRadarConfig);
 
   // ── POST /devices/:id/radar/config/get — Request device to publish its stored config
   router.post("/devices/:id/radar/config/get", (req, res) => {

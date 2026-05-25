@@ -149,9 +149,10 @@ function ROIBoxEditor({
                   min={limits.min}
                   max={limits.max}
                   value={box[`${axis}Min` as keyof ROIBox]}
-                  onChange={(e) =>
-                    update(`${axis}Min` as keyof ROIBox, parseFloat(e.target.value) || 0)
-                  }
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
+                    if (!isNaN(v)) update(`${axis}Min` as keyof ROIBox, v);
+                  }}
                   className="rc-number-input rc-number-input--sm"
                 />
               </div>
@@ -163,9 +164,10 @@ function ROIBoxEditor({
                   min={limits.min}
                   max={limits.max}
                   value={box[`${axis}Max` as keyof ROIBox]}
-                  onChange={(e) =>
-                    update(`${axis}Max` as keyof ROIBox, parseFloat(e.target.value) || 0)
-                  }
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
+                    if (!isNaN(v)) update(`${axis}Max` as keyof ROIBox, v);
+                  }}
                   className="rc-number-input rc-number-input--sm"
                 />
               </div>
@@ -421,26 +423,22 @@ export function RadarConfigSection({
       {/* ── Actions ─────────────────────────────────────── */}
       <div className="rc-apply-row">
         <button
+          type="button"
           className={`rc-apply-btn ${showSuccess ? "rc-apply-btn--success" : showError ? "rc-apply-btn--error" : ""}`}
-          onClick={() => {
-            if (showSuccess || showError) {
-              onResetApplyState();
-            } else {
-              onApply();
-            }
-          }}
+          onClick={onApply}
           disabled={isApplying}
         >
           {isApplying
             ? "⏳ A aplicar..."
             : showSuccess
-              ? "✓ Aplicado — Continuar"
+              ? "✓ Aplicado — Reenviar"
               : showError
                 ? "✗ Falhou — Tentar novamente"
                 : "Aplicar Configuração"}
         </button>
 
         <button
+          type="button"
           className="rc-action-btn rc-action-btn--warn"
           onClick={() => onSendRadarCommand("default_config")}
           disabled={loading || isApplying}

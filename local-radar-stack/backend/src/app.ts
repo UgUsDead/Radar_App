@@ -1,7 +1,6 @@
 import "express-async-errors";
 import cors from "cors";
 import express from "express";
-import rateLimit from "express-rate-limit";
 import jwt from "jsonwebtoken";
 import { EventEmitter } from "events";
 import type { Pool } from "pg";

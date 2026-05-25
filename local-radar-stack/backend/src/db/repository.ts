@@ -262,7 +262,7 @@ export class RadarRepository {
 
   public async touchRadar(radarId: string, lastSeenIso: string, ownerId?: number): Promise<void> {
     const ownerValue = Number.isInteger(ownerId) ? ownerId : null;
-    logger.info({ radarId, ownerValue }, "touchRadar operation");
+    logger.debug({ radarId, ownerValue }, "touchRadar operation");
     await this.pool.query(
       `INSERT INTO radar_devices (id, owner_id, last_seen, status)
        VALUES ($1, $2, $3, 'online')
@@ -270,7 +270,7 @@ export class RadarRepository {
        DO UPDATE SET
          last_seen = EXCLUDED.last_seen,
          status = 'online',
-         owner_id = EXCLUDED.owner_id,
+         owner_id = COALESCE(radar_devices.owner_id, EXCLUDED.owner_id),
          updated_at = NOW()`,
       [radarId, ownerValue, lastSeenIso]
     );
@@ -446,17 +446,21 @@ export class RadarRepository {
   public async getRooms(ownerId?: number): Promise<unknown[]> {
     const values: unknown[] = [];
     let whereSql = "";
+    let joinClause = "";
+    let radarJoinClause = "";
     if (Number.isInteger(ownerId)) {
       values.push(ownerId);
       whereSql = `WHERE r.owner_id = $${values.length}`;
+      joinClause = ` AND p.owner_id = $${values.length}`;
+      radarJoinClause = ` AND d.owner_id = $${values.length}`;
     }
     const { rows } = await this.pool.query(
       `SELECT r.id, r.name, r.floor, r.notes, r.metadata,
               p.id AS patient_id, p.name AS patient_name,
               d.id AS radar_id, d.status AS radar_status
        FROM rooms r
-       LEFT JOIN patients p ON p.room_id = r.id AND p.owner_id = r.owner_id
-       LEFT JOIN radar_devices d ON d.room_id = r.id AND d.owner_id = r.owner_id
+       LEFT JOIN patients p ON p.room_id = r.id${joinClause}
+       LEFT JOIN radar_devices d ON d.room_id = r.id${radarJoinClause}
        ${whereSql}
        ORDER BY r.floor ASC, r.name ASC`,
       values
@@ -467,14 +471,16 @@ export class RadarRepository {
   public async getPatients(ownerId?: number): Promise<unknown[]> {
     const values: unknown[] = [];
     let whereSql = "";
+    let joinClause = "";
     if (Number.isInteger(ownerId)) {
       values.push(ownerId);
       whereSql = `WHERE p.owner_id = $${values.length}`;
+      joinClause = ` AND r.owner_id = $${values.length}`;
     }
     const { rows } = await this.pool.query(
       `SELECT p.id, p.name, p.room_id, p.metadata, r.name AS room_name
        FROM patients p
-       LEFT JOIN rooms r ON r.id = p.room_id AND r.owner_id = p.owner_id
+       LEFT JOIN rooms r ON r.id = p.room_id${joinClause}
        ${whereSql}
        ORDER BY p.name ASC`,
       values
@@ -577,7 +583,7 @@ export class RadarRepository {
        FROM events e
        LEFT JOIN radar_devices d ON d.id = e.radar_id
        LEFT JOIN rooms r ON r.id = d.room_id
-       LEFT JOIN patients p ON p.room_id = r.id
+       LEFT JOIN patients p ON p.room_id = r.id AND p.owner_id IS NOT DISTINCT FROM e.owner_id
        ${whereSql}
        ORDER BY e.timestamp DESC
        LIMIT $${values.length}`,
@@ -607,7 +613,7 @@ export class RadarRepository {
        FROM events e
        LEFT JOIN radar_devices d ON d.id = e.radar_id
        LEFT JOIN rooms r ON r.id = d.room_id
-       LEFT JOIN patients p ON p.room_id = r.id
+       LEFT JOIN patients p ON p.room_id = r.id AND p.owner_id IS NOT DISTINCT FROM e.owner_id
        WHERE e.id = $1
        ${ownerClause}
        LIMIT 1`,

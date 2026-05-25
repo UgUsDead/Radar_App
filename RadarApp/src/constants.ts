@@ -23,21 +23,6 @@ export const PROBE_BATCH_TIMEOUT_MS = 12000;
 export const DEEP_SCAN_BATCH_SIZE = 18;
 export const DEEP_SCAN_TIMEOUT_MS = 2800;
 
-// Known broker candidates — update the first entry to match your computer IP
-export const MANUAL_BROKER_CANDIDATES = [
-  '192.168.1.204',  // Primary home broker IP (Docker host)
-  '10.10.128.175',  // Previous computer IP
-  '10.153.58.198',  // Known Jetson IP
-  '10.0.2.2',       // Android emulator -> host loopback
-  '10.0.3.2',       // Genymotion emulator -> host loopback
-  '127.0.0.1',      // Same-device broker
-  '192.168.1.1',
-  '192.168.0.1',
-  '10.0.0.1',
-  '192.168.1.175',
-  '10.0.0.175',
-];
-
 // Static subnets to always probe
 export const STATIC_SUBNETS = [
   '192.168.43', // Android mobile hotspot
@@ -46,21 +31,6 @@ export const STATIC_SUBNETS = [
   '192.168.0',  // Common home router
   '192.168.1',  // Common home router (alt)
   '10.0.0',
-];
-
-// Fallback IPs (last resort)
-export const FALLBACK_IPS = [
-  '192.168.1.204',
-  '10.153.58.198',
-  '10.244.127.197',
-  '192.168.43.2',
-  '192.168.43.3',
-  '192.168.43.4',
-  '172.20.10.2',
-  '172.20.10.3',
-  '10.42.0.2',
-  '192.168.0.2',
-  '192.168.1.2',
 ];
 
 // Provisioning

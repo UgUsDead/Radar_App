@@ -35,13 +35,12 @@ import {
 import {
   FALL_Z_THRESHOLD,
   SPEED_CHANGE_THRESHOLD,
-  MANUAL_BROKER_CANDIDATES,
 } from './src/constants';
 
 import {decodeRadarMessage} from './src/radar/radarDecoder';
 import {RadarTracker} from './src/radar/radarTracker';
 import {MQTTClient} from './src/mqtt/mqttClient';
-import {discoverBrokerCandidates, discoverBrokerIP, extractIPv4} from './src/mqtt/brokerDiscovery';
+import {extractIPv4} from './src/mqtt/brokerDiscovery';
 import {RadarAnalytics} from './src/services/radarAnalytics';
 import {
   saveSettingsForDevice,
@@ -97,13 +96,29 @@ const App: React.FC = () => {
   const [isScanning, setIsScanning] = useState(false);
   const [isReconnectingId, setIsReconnectingId] = useState<string | null>(null);
   const [provisionedRadars, setProvisionedRadars] = useState<ProvisionedRadarProfile[]>([]);
-  const [manualBrokerIP, setManualBrokerIP] = useState(MANUAL_BROKER_CANDIDATES[0] || '');
+  const [manualBrokerIP, setManualBrokerIP] = useState('');
   const [isManualConnecting, setIsManualConnecting] = useState(false);
   const [diagnosticsLogs, setDiagnosticsLogs] = useState<string[]>([]);
   const [showSetupFlow, setShowSetupFlow] = useState(false);
   const setMqttBrokerURI = useCallback((uri: string) => {
     setProvisioningState(prev => ({...prev, mqttBrokerURI: uri}));
   }, []);
+
+  const normalizeBrokerUri = useCallback((value: string): string => {
+    const trimmed = value.trim();
+    if (!trimmed) return '';
+    return /^\w+:\/\//.test(trimmed) ? trimmed : `mqtt://${trimmed}`;
+  }, []);
+
+  const extractBrokerHost = useCallback((value: string): string => {
+    const normalized = normalizeBrokerUri(value);
+    if (!normalized) return '';
+    try {
+      return new URL(normalized).hostname;
+    } catch {
+      return value.trim();
+    }
+  }, [normalizeBrokerUri]);
 
   const setupApiBase = useMemo(() => {
     const ip = extractIPv4(manualBrokerIP);
@@ -307,6 +322,7 @@ const App: React.FC = () => {
         debugLog('MQTT connected to ' + ip);
         mqttMsgCountRef.current = 0;
         trackerRef.current?.reset();
+        markProvisionedConnected(`Connected to broker ${ip}. Waiting for radar data...`);
         setProvisioningState(prev => ({
           ...prev,
           step: 'provisioning',
@@ -453,50 +469,6 @@ const App: React.FC = () => {
     await client.connect(brokerIP, {reconnect: true, connectTimeoutMs});
   }, [addAlert, debugLog, logDiagnostic, markProvisionedConnected]);
 
-  const connectWithBrokerCandidates = useCallback(async (
-    candidates: string[],
-    contextLabel: string,
-    options?: {maxAttempts?: number; connectTimeoutMs?: number},
-  ): Promise<string | null> => {
-    const MAX_BROKER_CONNECT_ATTEMPTS = Math.max(1, Math.min(14, options?.maxAttempts ?? 14));
-    const BROKER_CONNECT_TIMEOUT_MS = Math.max(3000, options?.connectTimeoutMs ?? 12000);
-
-    const uniqueCandidates = candidates
-      .map(ip => extractIPv4(ip))
-      .filter((ip): ip is string => !!ip)
-      .filter((ip, idx, arr) => arr.indexOf(ip) === idx);
-
-    const limitedCandidates = uniqueCandidates.slice(0, MAX_BROKER_CONNECT_ATTEMPTS);
-
-    if (!limitedCandidates.length) return null;
-
-    let lastError = 'Unknown broker connection error';
-    for (let index = 0; index < limitedCandidates.length; index += 1) {
-      const ip = limitedCandidates[index];
-      setProvisioningState(prev => ({
-        ...prev,
-        step: 'provisioning',
-        status: `${contextLabel}: trying broker ${index + 1}/${limitedCandidates.length} (${ip})...`,
-      }));
-      logDiagnostic(`${contextLabel}: trying broker ${ip}`);
-      try {
-        await setupMQTT(ip, BROKER_CONNECT_TIMEOUT_MS);
-        logDiagnostic(`${contextLabel}: connected to broker ${ip}`);
-        return ip;
-      } catch (err: any) {
-        lastError = err?.message || String(err);
-        logDiagnostic(`${contextLabel}: broker ${ip} failed (${lastError})`);
-      }
-    }
-
-    setProvisioningState(prev => ({
-      ...prev,
-      step: 'wifi_form',
-      status: `${contextLabel}: all broker candidates failed (${lastError})`,
-    }));
-    return null;
-  }, [setupMQTT, logDiagnostic]);
-
   const publishRadarConfig = useCallback((config: Partial<RadarFirmwareConfig>) => {
     if (!mqttRef.current || !currentRadarId) return;
     const topic = `linovt/${currentRadarId}/radar/config/set`;
@@ -613,22 +585,18 @@ const App: React.FC = () => {
       logDiagnostic('Provision flow started');
       await device.connect(provisioningState.radarPassword || undefined);
 
-      const preferredBrokerIP =
-        extractIPv4(manualBrokerIP) ||
-        extractIPv4(MANUAL_BROKER_CANDIDATES[0] || '');
+      const brokerUriToSend = normalizeBrokerUri(provisioningState.mqttBrokerURI);
 
-      if (!preferredBrokerIP) {
+      if (!brokerUriToSend) {
         setProvisioningState(prev => ({
           ...prev,
           step: 'wifi_form',
-          status: 'No valid broker IP configured in app.',
+          status: 'Enter the MQTT Broker URI before provisioning.',
         }));
-        logDiagnostic('Provisioning failed: no valid app broker IP');
+        logDiagnostic('Provisioning failed: no MQTT Broker URI configured');
         try { await Promise.resolve(device.disconnect()); } catch {}
         return;
       }
-
-      const brokerUriToSend = provisioningState.mqttBrokerURI?.trim() || `mqtt://${preferredBrokerIP}:1883`;
 
       setProvisioningState(prev => ({...prev, status: 'Sending MQTT configuration...'}));
       logDiagnostic(`Sending MQTT configuration: ${brokerUriToSend}`);
@@ -653,7 +621,7 @@ const App: React.FC = () => {
       // Sequence requirement: let radar finish MQTT startup before app broker connect attempts.
       setProvisioningState(prev => ({
         ...prev,
-        status: `Waiting for radar to connect to MQTT at ${preferredBrokerIP}...`,
+        status: `Waiting for radar to connect to MQTT at ${brokerUriToSend}...`,
       }));
       await new Promise<void>(r => setTimeout(r, 7000));
 
@@ -668,14 +636,14 @@ const App: React.FC = () => {
         setProvisioningState(prev => ({
           ...prev,
           step: 'provisioning',
-          status: `Provisioning: connecting app to broker ${attempt}/${APP_CONNECT_ATTEMPTS} (${preferredBrokerIP})...`,
+          status: `Provisioning: connecting app to broker ${attempt}/${APP_CONNECT_ATTEMPTS}...`,
         }));
-        logDiagnostic(`Provisioning app broker connect attempt ${attempt}/${APP_CONNECT_ATTEMPTS}: ${preferredBrokerIP}`);
+        logDiagnostic(`Provisioning app broker connect attempt ${attempt}/${APP_CONNECT_ATTEMPTS}: ${brokerUriToSend}`);
 
         try {
-          await setupMQTT(preferredBrokerIP, APP_CONNECT_TIMEOUT_MS);
-          connectedBrokerIP = preferredBrokerIP;
-          logDiagnostic(`Provisioning app broker connected: ${preferredBrokerIP}`);
+          await setupMQTT(brokerUriToSend, APP_CONNECT_TIMEOUT_MS);
+          connectedBrokerIP = extractBrokerHost(brokerUriToSend) || brokerUriToSend;
+          logDiagnostic(`Provisioning app broker connected: ${brokerUriToSend}`);
           break;
         } catch (err: any) {
           lastError = err?.message || String(err);
@@ -684,7 +652,7 @@ const App: React.FC = () => {
             setProvisioningState(prev => ({
               ...prev,
               step: 'provisioning',
-              status: `Waiting radar MQTT... retrying in ${Math.floor(APP_CONNECT_RETRY_DELAY_MS / 1000)}s (${preferredBrokerIP})`,
+              status: `Waiting radar MQTT... retrying in ${Math.floor(APP_CONNECT_RETRY_DELAY_MS / 1000)}s`,
             }));
             await new Promise<void>(r => setTimeout(r, APP_CONNECT_RETRY_DELAY_MS));
           }
@@ -696,7 +664,7 @@ const App: React.FC = () => {
         setProvisioningState(prev => ({
           ...prev,
           step: 'wifi_form',
-          status: `Provisioned Wi-Fi, but app could not connect to MQTT broker (${preferredBrokerIP}). ${lastError}`,
+          status: `Provisioned Wi-Fi, but app could not connect to the MQTT Broker URI. ${lastError}`,
         }));
         return;
       }
@@ -710,8 +678,7 @@ const App: React.FC = () => {
         devicePrefix: provisioningState.devicePrefix || 'PROV_',
         wifiSSID: provisioningState.wifiSSID,
         lastBrokerIP: connectedBrokerIP,
-        mqttBrokerURI:
-          provisioningState.mqttBrokerURI?.trim() || `mqtt://${connectedBrokerIP}:1883`,
+        mqttBrokerURI: brokerUriToSend,
         lastProvisionedAt: Date.now(),
       });
       logDiagnostic('Profile saved');
@@ -725,7 +692,7 @@ const App: React.FC = () => {
         await Promise.resolve(device.disconnect());
       } catch {}
     }
-  }, [provisioningState, setupMQTT, saveRadarProfile, applyDeviceSettings, logDiagnostic, manualBrokerIP]);
+  }, [provisioningState, setupMQTT, saveRadarProfile, applyDeviceSettings, logDiagnostic, normalizeBrokerUri, extractBrokerHost]);
 
   const reconnectProvisionedRadar = useCallback(async (profile: ProvisionedRadarProfile) => {
     if (isReconnectingId) return;
@@ -736,36 +703,21 @@ const App: React.FC = () => {
     try {
       logDiagnostic(`Reconnect start: ${profile.name}`);
       mqttRef.current?.disconnect();
-      const setStatus = (msg: string) => {
-        setProvisioningState(prev => ({...prev, status: msg}));
-        logDiagnostic(`Reconnect discovery: ${msg}`);
-      };
-      const brokerIP = await discoverBrokerIP(setStatus, profile.lastBrokerIP);
-
-      const candidates = await discoverBrokerCandidates(brokerIP || profile.lastBrokerIP, {
-        maxCandidates: 14,
-        includeStaticFallbacks: true,
-      });
-
-      if (!candidates.length) {
-        setProvisioningState(prev => ({...prev, step: 'scanning', status: `Could not find broker for ${profile.name}.`}));
+      const brokerUri = normalizeBrokerUri(profile.mqttBrokerURI || profile.lastBrokerIP);
+      if (!brokerUri) {
+        setProvisioningState(prev => ({...prev, step: 'scanning', status: `No MQTT Broker URI saved for ${profile.name}.`}));
         addAlert('info', `Reconnect failed for ${profile.name}`);
         setIsReconnectingId(null);
         setCurrentRadarId(null);
-        logDiagnostic(`Reconnect failed: ${profile.name}`);
+        logDiagnostic(`Reconnect failed: ${profile.name} has no saved broker URI`);
         return;
       }
 
-      const connectedBrokerIP = await connectWithBrokerCandidates(candidates, `Reconnect ${profile.name}`);
-      if (!connectedBrokerIP) {
-        setIsReconnectingId(null);
-        setCurrentRadarId(null);
-        return;
-      }
-
-      setProvisioningState(prev => ({...prev, step: 'provisioning', status: `Found broker at ${connectedBrokerIP}. Connecting...`}));
+      setProvisioningState(prev => ({...prev, step: 'provisioning', status: `Connecting to saved MQTT Broker URI for ${profile.name}...`}));
+      await setupMQTT(brokerUri, 12000);
+      const connectedBrokerIP = extractBrokerHost(brokerUri) || brokerUri;
       await applyDeviceSettings(profile.id);
-      await saveRadarProfile({...profile, lastBrokerIP: connectedBrokerIP, lastProvisionedAt: Date.now()});
+      await saveRadarProfile({...profile, lastBrokerIP: connectedBrokerIP, mqttBrokerURI: brokerUri, lastProvisionedAt: Date.now()});
       setIsReconnectingId(null);
       logDiagnostic(`Reconnect broker resolved, waiting for MQTT onConnect: ${profile.name}`);
     } catch (e: any) {
@@ -774,49 +726,35 @@ const App: React.FC = () => {
       setCurrentRadarId(null);
       logDiagnostic(`Reconnect error: ${e?.message || 'Unknown'}`);
     }
-  }, [isReconnectingId, addAlert, saveRadarProfile, setupMQTT, applyDeviceSettings, logDiagnostic]);
+  }, [isReconnectingId, addAlert, saveRadarProfile, setupMQTT, applyDeviceSettings, logDiagnostic, normalizeBrokerUri, extractBrokerHost]);
 
   const connectManualBroker = useCallback(async () => {
     if (isManualConnecting) return;
-    const ip = extractIPv4(manualBrokerIP);
-    if (!ip) {
-      setProvisioningState(prev => ({...prev, status: 'Enter a valid broker IPv4 address.'}));
-      addAlert('info', 'Invalid broker IP');
+    const brokerUri = normalizeBrokerUri(manualBrokerIP);
+    if (!brokerUri) {
+      setProvisioningState(prev => ({...prev, status: 'Enter a valid MQTT Broker URI.'}));
+      addAlert('info', 'Invalid broker URI');
       return;
     }
     setIsManualConnecting(true);
-    setProvisioningState(prev => ({...prev, step: 'provisioning', status: `Connecting directly to broker ${ip}...`}));
+    setProvisioningState(prev => ({...prev, step: 'provisioning', status: `Connecting directly to broker ${brokerUri}...`}));
     setConnectionStatus('Connecting...');
-    logDiagnostic(`Manual broker connect: ${ip}`);
+    logDiagnostic(`Manual broker connect: ${brokerUri}`);
     try {
       mqttRef.current?.disconnect();
       try {
-        await setupMQTT(ip, 12000);
-        addAlert('info', `Direct connect to ${ip}`);
+        await setupMQTT(brokerUri, 12000);
+        addAlert('info', `Direct connect to ${brokerUri}`);
         logDiagnostic('Waiting for MQTT onConnect before entering radar view');
         return;
       } catch (err: any) {
-        logDiagnostic(`Direct connect failed for ${ip}: ${err?.message || String(err)}`);
+        logDiagnostic(`Direct connect failed for ${brokerUri}: ${err?.message || String(err)}`);
       }
-
-      const candidates = await discoverBrokerCandidates(ip, {
-        maxCandidates: 14,
-        includeStaticFallbacks: true,
-      });
-
-      const connectedBrokerIP = await connectWithBrokerCandidates(candidates, 'Manual connect');
-      if (!connectedBrokerIP) {
-        addAlert('info', 'Manual connect failed for all broker candidates');
-        return;
-      }
-
-      setManualBrokerIP(connectedBrokerIP);
-      addAlert('info', `Connected to broker ${connectedBrokerIP}`);
-      logDiagnostic('Manual connect fallback succeeded; waiting for MQTT onConnect');
+      addAlert('info', 'Manual connect failed');
     } finally {
       setIsManualConnecting(false);
     }
-  }, [isManualConnecting, manualBrokerIP, setupMQTT, addAlert, logDiagnostic, connectWithBrokerCandidates]);
+  }, [isManualConnecting, manualBrokerIP, setupMQTT, addAlert, logDiagnostic, normalizeBrokerUri]);
 
   // ── Radar Selection ─────────────────────────────
 
@@ -1030,9 +968,6 @@ const App: React.FC = () => {
         onDebug={() => setShowDebug(true)}
         onDisconnect={disconnect}
         settingsSaved={settingsSaved}
-        currentRoom={selectedRadarRoom}
-        currentPatient={selectedRadarPatient}
-        zones={zones}
         onRadarConfig={() => setShowRadarConfig(true)}
         onLogs={() => setShowConnectionLogs(true)}
       />
