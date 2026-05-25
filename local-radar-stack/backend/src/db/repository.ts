@@ -208,13 +208,30 @@ export class RadarRepository {
       ALTER TABLE events
         ADD CONSTRAINT events_type_check
         CHECK (type IN ('fall', 'anomaly', 'departure', 'arrival', 'transition', 'staff_entry', 'dwell'));
-
-      INSERT INTO users (username, password_hash, role, permissions)
-      SELECT 'admin', '$2b$10$.r.uo8YYT8qaZ7ZCjmTW9u8a6lyFxnXblYqiWe/8HuJB1xpmoXHlC', 'admin', '[]'::jsonb
-      WHERE NOT EXISTS (SELECT 1 FROM users);
     `;
 
     await this.pool.query(schemaSql);
+
+    // Securely bootstrap admin user if no users exist
+    const { rows } = await this.pool.query("SELECT 1 FROM users LIMIT 1");
+    if (rows.length === 0) {
+      const envPassword = process.env.ADMIN_PASSWORD?.trim();
+      if (!envPassword) {
+        logger.error("CRITICAL: No users found and ADMIN_PASSWORD is not set. Startup failing.");
+        throw new Error("Admin bootstrap required. Set ADMIN_PASSWORD environment variable.");
+      }
+
+      let hash = "";
+      if (envPassword) {
+        const bcrypt = await import("bcrypt");
+        hash = await bcrypt.default.hash(envPassword, 10);
+        logger.info("Admin user bootstrapped using ADMIN_PASSWORD from environment.");
+      }
+      await this.pool.query(
+        "INSERT INTO users (username, password_hash, role, permissions) VALUES ($1, $2, $3, $4)",
+        ["admin", hash, "admin", "[]"]
+      );
+    }
   }
 
   public enqueueEvent(event: EventRecord): void {
@@ -315,18 +332,18 @@ export class RadarRepository {
     
     try {
       const startedAt = Date.now();
-      const eventsBefore = this.eventQueue.length;
-      const summariesBefore = this.summaryQueue.length;
-
-      await Promise.all([this.flushEvents(), this.flushSummaries()]);
+      const [eventsFlushed, summariesFlushed] = await Promise.all([
+        this.flushEvents(),
+        this.flushSummaries(),
+      ]);
 
       this.lastFlushDurationMs = Date.now() - startedAt;
       this.lastFlushAt = new Date().toISOString();
-      this.lastFlushEventCount = eventsBefore;
-      this.lastFlushSummaryCount = summariesBefore;
+      this.lastFlushEventCount = eventsFlushed;
+      this.lastFlushSummaryCount = summariesFlushed;
       this.totalFlushes += 1;
-      this.totalFlushedEvents += eventsBefore;
-      this.totalFlushedSummaries += summariesBefore;
+      this.totalFlushedEvents += eventsFlushed;
+      this.totalFlushedSummaries += summariesFlushed;
     } finally {
       this.flushing = false;
     }
@@ -948,9 +965,10 @@ export class RadarRepository {
     logger.info({ eventUuid, frameCount: telemetry.length }, "Finalized event telemetry snapshot");
   }
 
-  private async flushEvents(): Promise<void> {
+  private async flushEvents(): Promise<number> {
+    let flushed = 0;
     while (this.eventQueue.length > 0) {
-      const batch = this.eventQueue.splice(0, config.db.batchSize);
+      const batch = this.eventQueue.slice(0, config.db.batchSize);
       const placeholders: string[] = [];
       const values: unknown[] = [];
 
@@ -968,18 +986,28 @@ export class RadarRepository {
         );
       });
 
-      await this.pool.query(
-        `INSERT INTO events (owner_id, radar_id, type, timestamp, duration, metadata, telemetry_snapshot)
-         VALUES ${placeholders.join(",")}`,
-        values
-      );
+      try {
+        await this.pool.query(
+          `INSERT INTO events (owner_id, radar_id, type, timestamp, duration, metadata, telemetry_snapshot)
+           VALUES ${placeholders.join(",")}`,
+          values
+        );
+      } catch (error) {
+        logger.error({ error, count: batch.length }, "Failed to flush events batch");
+        throw error;
+      }
+
+      this.eventQueue.splice(0, batch.length);
+      flushed += batch.length;
       logger.info({ count: batch.length }, "Flushed events batch");
     }
+    return flushed;
   }
 
-  private async flushSummaries(): Promise<void> {
+  private async flushSummaries(): Promise<number> {
+    let flushed = 0;
     while (this.summaryQueue.length > 0) {
-      const batch = this.summaryQueue.splice(0, config.db.batchSize);
+      const batch = this.summaryQueue.slice(0, config.db.batchSize);
       const placeholders: string[] = [];
       const values: unknown[] = [];
 
@@ -1002,14 +1030,23 @@ export class RadarRepository {
         );
       });
 
-      await this.pool.query(
-        `INSERT INTO summaries (
-          owner_id, radar_id, timestamp, avg_height, movement_level, active_targets,
-          avg_walking_speed, distance_moved, gait_stability, posture_stability
-        ) VALUES ${placeholders.join(",")}`,
-        values
-      );
+      try {
+        await this.pool.query(
+          `INSERT INTO summaries (
+            owner_id, radar_id, timestamp, avg_height, movement_level, active_targets,
+            avg_walking_speed, distance_moved, gait_stability, posture_stability
+          ) VALUES ${placeholders.join(",")}`,
+          values
+        );
+      } catch (error) {
+        logger.error({ error, count: batch.length }, "Failed to flush summaries batch");
+        throw error;
+      }
+
+      this.summaryQueue.splice(0, batch.length);
+      flushed += batch.length;
       logger.info({ count: batch.length }, "Flushed summaries batch");
     }
+    return flushed;
   }
 }

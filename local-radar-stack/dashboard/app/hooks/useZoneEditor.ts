@@ -1,8 +1,8 @@
 import { apiFetch } from "../utils/api";
+import { subscribeToStream } from "../utils/stream";
 import { useState, useCallback, useMemo, useRef, useEffect } from "react";
 import { ZoneConfig, ZoneBehavior, ZonePriority } from "../types/zones";
 import { RoomRow } from "../types/domain";
-import { apiBase } from "../constants/api";
 import { ZONE_GRAPH_SIZE } from "../constants/zones";
 
 export function useZoneEditor(
@@ -38,12 +38,13 @@ export function useZoneEditor(
   const activeRoomModel = useMemo(() => {
     const activeRoom = rooms.find(r => r.radar_id === selectedZoneRadarId);
     if (activeRoom && activeRoom.metadata) {
+      const model = (activeRoom.metadata as any).zone_room_model ?? activeRoom.metadata;
       return {
-        roomWidthMeters: Number(activeRoom.metadata.roomWidthMeters) || 12,
-        roomDepthMeters: Number(activeRoom.metadata.roomDepthMeters) || 12,
-        originX: Number(activeRoom.metadata.originX) || 0,
-        originY: Number(activeRoom.metadata.originY) || 0,
-        radarHeightMeters: Number(activeRoom.metadata.radarHeightMeters) || 2.5
+        roomWidthMeters: Number(model.roomWidthMeters) || 12,
+        roomDepthMeters: Number(model.roomDepthMeters) || 12,
+        originX: Number(model.originX) || 0,
+        originY: Number(model.originY) || 0,
+        radarHeightMeters: Number(model.radarHeightMeters) || 2.5
       };
     }
     return {
@@ -172,23 +173,28 @@ export function useZoneEditor(
       return;
     }
     
-    const token = typeof window !== "undefined" ? localStorage.getItem("radar_auth_token") : null;
-    const url = `${apiBase}/monitor/stream${token ? `?token=${token}` : ""}`;
-    const sse = new EventSource(url);
-    
-    sse.onmessage = (e) => {
-      try {
-        const payload = JSON.parse(e.data);
-        if (payload.radarId === selectedZoneRadarId && payload.frame?.targets) {
-          setLiveTargets(payload.frame.targets);
+    let unsubscribe: (() => void) | null = null;
+    let cancelled = false;
+
+    void (async () => {
+      const stop = await subscribeToStream({
+        onMessage: (payload) => {
+          const data = payload as any;
+          if (data?.radarId === selectedZoneRadarId && data?.frame?.targets) {
+            setLiveTargets(data.frame.targets);
+          }
         }
-      } catch (err) {
-        // Ignore JSON parse errors (like keepalive payloads)
+      });
+      if (cancelled) {
+        stop();
+        return;
       }
-    };
-    
+      unsubscribe = stop;
+    })();
+
     return () => {
-      sse.close();
+      cancelled = true;
+      if (unsubscribe) unsubscribe();
       setLiveTargets([]);
     };
   }, [selectedZoneRadarId]);

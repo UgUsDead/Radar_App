@@ -196,7 +196,7 @@ class ControlListener:
 
                 logger.info("Unknown command: %s", line)
         except Exception:
-            pass
+            logger.exception("Stdin control loop crashed")
 
     @staticmethod
     def _token_to_target(token: str) -> str:

@@ -224,8 +224,17 @@ export function createMonitorRouter(deps: MonitorRouterDeps): express.Router {
   });
 
   router.get("/monitor/patients/:id/heatmap", async (req, res) => {
-    const patientId = parseInt(req.params.id);
-    const hours = parseInt(req.query.hours as string) || 24;
+    const patientId = Number.parseInt(req.params.id, 10);
+    const rawHours = req.query.hours;
+    const hours = rawHours == null ? 24 : Number.parseInt(String(rawHours), 10);
+    if (!Number.isInteger(patientId)) {
+      res.status(400).json({ error: "Invalid patient id" });
+      return;
+    }
+    if (!Number.isInteger(hours) || hours < 1 || hours > 168) {
+      res.status(400).json({ error: "hours must be an integer between 1 and 168" });
+      return;
+    }
     try {
       const ownerId = resolveOwnerId(req);
       const values: unknown[] = [patientId, hours];
@@ -261,7 +270,10 @@ export function createMonitorRouter(deps: MonitorRouterDeps): express.Router {
       if (!Number.isInteger(ownerId)) return;
       const radars = await repository.getRadars({ onlyUnassigned: false, ownerId });
       allowedRadarIds = new Set(
-        (radars as Array<{ id?: string }>).map((r) => String(r.id ?? "")).filter(Boolean)
+        (radars as Array<{ id?: string; owner_id?: number | null }>)
+          .filter((r) => Number(r.owner_id) === ownerId)
+          .map((r) => String(r.id ?? ""))
+          .filter(Boolean)
       );
     };
 
@@ -276,17 +288,28 @@ export function createMonitorRouter(deps: MonitorRouterDeps): express.Router {
       "Connection": "keep-alive"
     });
     res.flushHeaders?.();
-    res.write(`event: ready\ndata: ${JSON.stringify({ ok: true })}\n\n`);
+    let canWrite = true;
+    res.on("drain", () => {
+      canWrite = true;
+    });
+
+    const safeWrite = (payload: string) => {
+      if (!canWrite) return;
+      const ok = res.write(payload);
+      if (!ok) canWrite = false;
+    };
+
+    safeWrite(`event: ready\ndata: ${JSON.stringify({ ok: true })}\n\n`);
     const listener = (data: any) => {
       if (Number.isInteger(ownerId) && !allowedRadarIds.has(String(data?.radarId ?? ""))) return;
-      res.write(`data: ${JSON.stringify(data)}\n\n`);
+      safeWrite(`data: ${JSON.stringify(data)}\n\n`);
     };
     const heartbeat = setInterval(() => {
-      res.write(`: keepalive ${Date.now()}\n\n`);
+      safeWrite(`: keepalive ${Date.now()}\n\n`);
     }, 15000);
     const eventListener = (event: any) => {
       if (Number.isInteger(ownerId) && !allowedRadarIds.has(String(event?.radar_id ?? ""))) return;
-      res.write(`event: alert\ndata: ${JSON.stringify(event)}\n\n`);
+      safeWrite(`event: alert\ndata: ${JSON.stringify(event)}\n\n`);
     };
     frameStream.on("frame", listener);
     frameStream.on("event", eventListener);

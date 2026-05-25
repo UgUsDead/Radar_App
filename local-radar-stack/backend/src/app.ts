@@ -2,6 +2,7 @@ import "express-async-errors";
 import cors from "cors";
 import express from "express";
 import jwt from "jsonwebtoken";
+import rateLimit from "express-rate-limit";
 import { EventEmitter } from "events";
 import type { Pool } from "pg";
 import { RadarRepository } from "./db/repository.js";
@@ -62,6 +63,11 @@ export function createApp(deps: AppDeps): express.Express {
     .map(origin => origin.trim())
     .filter(Boolean);
 
+  const env = process.env.NODE_ENV ?? "development";
+  if (env === "production" && (!corsOrigins || corsOrigins.length === 0)) {
+    throw new Error("CORS_ALLOWED_ORIGINS must be set in production");
+  }
+
   app.use(cors({
     origin: corsOrigins && corsOrigins.length > 0 ? corsOrigins : true,
     credentials: true
@@ -73,13 +79,25 @@ export function createApp(deps: AppDeps): express.Express {
     next();
   });
 
-  // Rate limiter removed for internal tools handling heavy polling
-  // const limiter = rateLimit({
-  //   windowMs: 15 * 60 * 1000,
-  //   limit: 1000,
-  //   message: { error: "Too many requests, please try again later." }
-  // });
-  // app.use(limiter);
+  const loginLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many login attempts. Please try again later." }
+  });
+
+  const apiLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    limit: 600,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many requests. Please try again later." },
+    skip: (req) => req.path === "/monitor/stream"
+  });
+
+  app.use("/auth/login", loginLimiter);
+  app.use(apiLimiter);
 
   const authMiddleware = (req: express.Request, res: express.Response, next: express.NextFunction) => {
     const publicPaths = ['/health', '/monitor/health', '/auth/login'];
@@ -89,11 +107,14 @@ export function createApp(deps: AppDeps): express.Express {
     }
 
     let token = "";
+    let tokenSource: "header" | "query" | "none" = "none";
     const authHeader = req.headers.authorization;
     if (authHeader?.startsWith("Bearer ")) {
       token = authHeader.split(" ")[1];
-    } else if (req.query.token && typeof req.query.token === "string") {
+      tokenSource = "header";
+    } else if (req.path === "/monitor/stream" && req.query.token && typeof req.query.token === "string") {
       token = req.query.token;
+      tokenSource = "query";
     }
 
     if (!token) {
@@ -104,6 +125,12 @@ export function createApp(deps: AppDeps): express.Express {
     
     try {
       const decoded = jwt.verify(token, getJwtSecret()) as any;
+      if (tokenSource === "query") {
+        if (decoded?.scope !== "stream") {
+          res.status(401).json({ error: "Invalid stream token" });
+          return;
+        }
+      }
       req.user = {
         id: decoded.id,
         username: decoded.username,

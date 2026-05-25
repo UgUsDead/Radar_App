@@ -81,10 +81,10 @@ export function usePatientActions(load: () => Promise<void>) {
     setAssigningPatientId(patient.id);
     setMessage("");
     try {
-      const response = await apiFetch(`/assign-patient`, {
-        method: "POST",
+      const response = await apiFetch(`/patients/${patient.id}/room`, {
+        method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ patientId: patient.id, roomId })
+        body: JSON.stringify({ roomId })
       });
 
       if (!response.ok) {

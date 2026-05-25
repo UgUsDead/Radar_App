@@ -1,5 +1,6 @@
 import "dotenv/config";
 import { z } from "zod";
+import { randomUUID } from "node:crypto";
 
 const schema = z.object({
   PORT: z.coerce.number().default(4000),
@@ -37,6 +38,9 @@ if (!parsed.success) {
 }
 
 const env = parsed.data;
+const mqttClientId = process.env.MQTT_CLIENT_ID
+  ? env.MQTT_CLIENT_ID
+  : `radar-backend-${randomUUID().slice(0, 8)}`;
 
 export const config = {
   port: env.PORT,
@@ -48,7 +52,7 @@ export const config = {
     url: env.MQTT_URL,
     username: env.MQTT_USERNAME,
     password: env.MQTT_PASSWORD,
-    clientId: env.MQTT_CLIENT_ID,
+    clientId: mqttClientId,
     subTopic: env.MQTT_TOPIC,
     reconnectPeriodMs: env.MQTT_RECONNECT_PERIOD_MS,
     offlineSeconds: env.RADAR_OFFLINE_SECONDS

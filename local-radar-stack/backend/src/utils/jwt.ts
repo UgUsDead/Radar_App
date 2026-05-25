@@ -8,6 +8,12 @@ export function getJwtSecret(): string {
     return secret;
   }
 
-  logger.warn("JWT_SECRET is not configured; using default development secret");
-  return DEFAULT_DEV_SECRET;
+  const env = process.env.NODE_ENV ?? "development";
+  if (env === "development" || env === "test") {
+    logger.warn("JWT_SECRET is not configured; using default development secret");
+    return DEFAULT_DEV_SECRET;
+  }
+
+  logger.error("JWT_SECRET is not configured; refusing to start in production");
+  throw new Error("JWT_SECRET must be configured in production");
 }

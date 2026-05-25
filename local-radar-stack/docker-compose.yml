@@ -49,7 +49,7 @@ services:
       MQTT_TOPIC: ${MQTT_TOPIC}
       RADAR_OFFLINE_SECONDS: ${RADAR_OFFLINE_SECONDS}
       DEBUG_MODE: ${DEBUG_MODE}
-      ALLOW_TESTING_ROUTES: "true"
+      ALLOW_TESTING_ROUTES: ${ALLOW_TESTING_ROUTES:-false}
     ports:
       - "${BACKEND_PORT:-4000}:4000"
     networks:

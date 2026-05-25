@@ -338,6 +338,7 @@ export class RadarPipeline {
 
 
     state.frameBuffer.push(frame);
+    pruneBuffer(state, now);
     state.processedFrames += 1;
     downsampleAndAccumulate(state, frame);
 
@@ -476,11 +477,12 @@ export class RadarPipeline {
     const isAssigned = ownerId !== null && rows.length > 0 && rows[0].room_id !== null;
     const patientMetadata = rows.length > 0 ? asRecord(rows[0].patient_metadata) : {};
     const roomMetadata = rows.length > 0 ? asRecord(rows[0].room_metadata) : {};
+    const roomModel = asRecord(roomMetadata.zone_room_model ?? roomMetadata);
 
     const profile = riskProfileService.getRiskProfile(patientMetadata);
     
     // Use radarHeight from room metadata, default to 2.5
-    const radarHeightMeters = Number(roomMetadata.radarHeightMeters) || 2.5;
+    const radarHeightMeters = Number(roomModel.radarHeightMeters) || 2.5;
 
     const resolved: CachedRiskSensitivity = {
       ownerId,

@@ -1,8 +1,8 @@
 import { apiFetch } from "../utils/api";
+import { subscribeToStream } from "../utils/stream";
 import { useState, useEffect, useCallback, MutableRefObject } from "react";
 import { Radar, RoomRow, Patient, EventRow, DailyRow, WatchlistRow } from "../types/domain";
 import { MonitorHealth } from "../types/health";
-import { apiBase } from "../constants/api";
 
 export function useDashboardData(interactingRef: MutableRefObject<boolean>) {
   const [allRadars, setAllRadars] = useState<Radar[]>([]);
@@ -66,45 +66,35 @@ export function useDashboardData(interactingRef: MutableRefObject<boolean>) {
       // Skip auto-refresh while user is actively interacting with management controls
       if (interactingRef.current) return;
       void load();
-    }, 2_000);
+    }, 10_000);
 
-    let sse: EventSource | null = null;
-    let retryCount = 0;
-    
-    const connectSSE = () => {
-      const token = typeof window !== "undefined" ? localStorage.getItem("radar_auth_token") : null;
-      const url = `${apiBase}/monitor/stream${token ? `?token=${token}` : ""}`;
-      sse = new EventSource(url);
-      
-      sse.addEventListener("alert", (e) => {
-        try {
-          const newEvent = JSON.parse(e.data);
+    let unsubscribe: (() => void) | null = null;
+    let cancelled = false;
+
+    void (async () => {
+      const stop = await subscribeToStream({
+        onAlert: (payload) => {
+          const newEvent = payload as any;
           setEvents((prev) => {
             if (prev.some(ev => ev.id === newEvent.id)) return prev;
             return [newEvent, ...prev].slice(0, 20);
           });
-        } catch (err) {
-          console.error("Failed to parse real-time alert", err);
+        },
+        onError: () => {
+          // SSE auto-reconnects; keep polling as a fallback
         }
       });
-
-      sse.addEventListener("open", () => {
-        retryCount = 0;
-      });
-
-      sse.addEventListener("error", () => {
-        if (sse) sse.close();
-        const backoffMs = Math.min(1000 * Math.pow(2, retryCount), 30000);
-        retryCount++;
-        setTimeout(connectSSE, backoffMs);
-      });
-    };
-    
-    connectSSE();
+      if (cancelled) {
+        stop();
+        return;
+      }
+      unsubscribe = stop;
+    })();
 
     return () => {
       clearInterval(timer);
-      if (sse) sse.close();
+      cancelled = true;
+      if (unsubscribe) unsubscribe();
     };
   }, [load, interactingRef]);
 
@@ -113,7 +103,7 @@ export function useDashboardData(interactingRef: MutableRefObject<boolean>) {
       const res = await apiFetch(`/patients/${patientId}/risk-profile`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ riskProfile })
+        body: JSON.stringify(riskProfile)
       });
       if (!res.ok) throw new Error("Failed to update risk profile");
       await load();

@@ -106,6 +106,15 @@ export function createPatientRouter(deps: PatientRouterDeps): express.Router {
     }
     
     try {
+      const payload =
+        req.body && typeof req.body === "object" && !Array.isArray(req.body) && "riskProfile" in req.body
+          ? (req.body as Record<string, unknown>).riskProfile
+          : req.body;
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        res.status(400).json({ error: "Invalid risk profile payload" });
+        return;
+      }
+
       const patients = await repository.getPatients(resolveOwnerId(req));
       const patient = patients.find((p: any) => p.id === patientId);
       
@@ -114,7 +123,7 @@ export function createPatientRouter(deps: PatientRouterDeps): express.Router {
         return;
       }
       
-      const updatedMetadata = riskProfileService.updateRiskProfile((patient as any).metadata, req.body);
+      const updatedMetadata = riskProfileService.updateRiskProfile((patient as any).metadata, payload as Record<string, unknown>);
       await repository.updatePatient(patientId, { metadata: updatedMetadata }, resolveOwnerId(req));
       
       const newProfile = riskProfileService.getRiskProfile(updatedMetadata);

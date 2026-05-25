@@ -2,6 +2,7 @@
 
 import React, { createContext, useContext, useState, useEffect } from "react";
 import { useRouter, usePathname } from "next/navigation";
+import { clearStreamTokenCache } from "../utils/streamToken";
 
 export interface User {
   id: number;
@@ -64,6 +65,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     localStorage.removeItem("radar_auth_user");
     setToken(null);
     setUser(null);
+    clearStreamTokenCache();
     router.push("/login");
   };
 

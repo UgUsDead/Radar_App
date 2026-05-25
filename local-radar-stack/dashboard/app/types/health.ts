@@ -1,4 +1,6 @@
 export type MonitorHealth = {
+  ok?: boolean;
+  mqttConnected?: boolean;
   queueDepth: { events: number; summaries: number };
   flush: {
     lastFlushDurationMs: number;
@@ -17,10 +19,9 @@ export type MonitorHealth = {
     newestLastSeenSeconds: number | null;
   };
   messageRates: {
-    totalMessages: number;
-    totalBytes: number;
-    msgsPerSecond: number;
-    bytesPerSecond: number;
+    intervalMs: number;
+    updatedAt: string;
+    rates: Array<{ radarId: string; messagesPerSecond: number }>;
   };
   ingestLag: Array<{ radarId: string; latestMs: number; averageMs: number; maxMs: number; samples: number }>;
   generatedAt: string;

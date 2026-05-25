@@ -142,6 +142,7 @@ async function main(): Promise<void> {
     clearInterval(escalationBackgroundJob);
     clearInterval(flushTimer);
     clearInterval(offlineTimer);
+    heatmapService.stop();
     rateMonitor.stop();
     await repository.flush();
     await mqttClient.stop();

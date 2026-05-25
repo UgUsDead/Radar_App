@@ -12,8 +12,8 @@ export function createTestingRouter(deps: TestingRouterDeps): express.Router {
   const router = express.Router();
 
   router.post("/testing/clear-database", requireAdmin, async (_req, res) => {
-    if (process.env.NODE_ENV === "production" && process.env.ALLOW_TESTING_ROUTES !== "true") {
-      res.status(403).json({ error: "Not available in production" });
+    if (process.env.ALLOW_TESTING_ROUTES !== "true") {
+      res.status(403).json({ error: "Testing routes disabled. Set ALLOW_TESTING_ROUTES=true to enable." });
       return;
     }
     

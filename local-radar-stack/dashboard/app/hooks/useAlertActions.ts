@@ -14,7 +14,7 @@ export function useAlertActions(events: EventRow[], load: () => Promise<void>) {
 
   const fallAlerts = useMemo(() => events.filter((event) => ["fall", "anomaly", "departure", "arrival", "transition", "dwell"].includes(event.type)), [events]);
   const activeFallAlerts = useMemo(
-    () => fallAlerts.filter((event) => (event.alert_status ?? "new") !== "resolved"),
+    () => fallAlerts.filter((event) => !["resolved", "closed"].includes(event.alert_status ?? "new")),
     [fallAlerts]
   );
   const criticalAlerts = useMemo(() => activeFallAlerts.slice(0, 20), [activeFallAlerts]);

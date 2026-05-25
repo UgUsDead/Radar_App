@@ -47,20 +47,44 @@ export class HeatmapAggregationService {
     try {
       await client.query("BEGIN");
       
+      const ownerIds: number[] = [];
+      const patientIds: number[] = [];
+      const hourTimestamps: string[] = [];
+      const gridXs: number[] = [];
+      const gridYs: number[] = [];
+      const durations: number[] = [];
+
       for (const [key, seconds] of snapshot) {
         const [ownerIdStr, patientIdStr, hourIso, gridXStr, gridYStr] = key.split("|");
-        const ownerId = parseInt(ownerIdStr);
-        const patientId = parseInt(patientIdStr);
-        const gridX = parseInt(gridXStr);
-        const gridY = parseInt(gridYStr);
+        const ownerId = parseInt(ownerIdStr, 10);
+        const patientId = parseInt(patientIdStr, 10);
+        const gridX = parseInt(gridXStr, 10);
+        const gridY = parseInt(gridYStr, 10);
 
-        await client.query(`
-          INSERT INTO patient_spatial_stats (owner_id, patient_id, hour_timestamp, grid_x, grid_y, duration_seconds)
-          VALUES ($1, $2, $3, $4, $5, $6)
-          ON CONFLICT (patient_id, hour_timestamp, grid_x, grid_y)
-          DO UPDATE SET duration_seconds = patient_spatial_stats.duration_seconds + EXCLUDED.duration_seconds
-        `, [ownerId, patientId, hourIso, gridX, gridY, Math.round(seconds)]);
+        if (!Number.isInteger(ownerId) || !Number.isInteger(patientId) || !Number.isInteger(gridX) || !Number.isInteger(gridY)) {
+          continue;
+        }
+
+        ownerIds.push(ownerId);
+        patientIds.push(patientId);
+        hourTimestamps.push(hourIso);
+        gridXs.push(gridX);
+        gridYs.push(gridY);
+        durations.push(Math.round(seconds));
       }
+
+      if (ownerIds.length === 0) {
+        await client.query("COMMIT");
+        return;
+      }
+
+      await client.query(
+        `INSERT INTO patient_spatial_stats (owner_id, patient_id, hour_timestamp, grid_x, grid_y, duration_seconds)
+         SELECT * FROM UNNEST($1::int[], $2::int[], $3::timestamptz[], $4::int[], $5::int[], $6::int[])
+         ON CONFLICT (patient_id, hour_timestamp, grid_x, grid_y)
+         DO UPDATE SET duration_seconds = patient_spatial_stats.duration_seconds + EXCLUDED.duration_seconds`,
+        [ownerIds, patientIds, hourTimestamps, gridXs, gridYs, durations]
+      );
 
       await client.query("COMMIT");
     } catch (err) {

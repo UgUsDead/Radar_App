@@ -298,22 +298,29 @@ export default function FeedPage() {
     }
 
     const entries: FeedEntry[] = [];
-    for (const radarId of Object.keys(radars)) {
-      const room = byRadar.get(radarId);
-      const floor = room?.floor ?? null;
-      const roomName = room?.name ?? null;
-      const patientName = room?.patient_name ?? null;
+    for (const radarId of byRadar.keys()) {
+      const room = byRadar.get(radarId)!;
+      const floor = room.floor ?? null;
+      const roomName = room.name ?? null;
+      const patientName = room.patient_name ?? null;
 
       if (!roomName) {
         continue;
       }
 
-      const assignedFloor = room?.floor ?? 0;
-      const assignedRoomName = room?.name ?? "Quarto Desconhecido";
+      const frame = radars[radarId] || {
+        timestamp: Date.now(),
+        sequenceId: 0,
+        targets: [],
+        zones: []
+      };
+
+      const assignedFloor = room.floor ?? 0;
+      const assignedRoomName = room.name ?? "Quarto Desconhecido";
 
       entries.push({
         radarId,
-        frame: radars[radarId],
+        frame,
         floor,
         roomName,
         patientName,
