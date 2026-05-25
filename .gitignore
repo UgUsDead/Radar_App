@@ -1,0 +1,16 @@
+node_modules/
+.venv/
+*.rar
+build/
+dist/
+.next/
+.expo/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.env*.local
+.env
+.git/
+android/app/build/
+ios/build/
+*service-account.json

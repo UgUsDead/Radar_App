@@ -1,0 +1,1783 @@
+=== Linux/radar_simulator/radar_model.py ===
+"""
+radar_model.py — Radar frame generator.
+
+Combines person simulation, point cloud generation, and artifact injection
+to produce a stream of TargetData-per-frame that gets protobuf-encoded and
+published.
+
+Responsibilities:
+  • Manage the list of simulated persons
+  • Step the physics each tick
+  • Convert persons → TargetData (with noise)
+  • Inject ghost targets and decide whether to drop frames
+  • Accept runtime commands (add/remove people, trigger fall)
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import threading
+from typing import Optional
+
+from .config import SimConfig, RoomConfig, PersonConfig, ArtifactConfig
+from .person_model import Person, PersonState, create_person
+from .pointcloud_generator import (
+    RawPoint,
+    generate_point_cloud,
+    generate_ghost_points,
+)
+from .protobuf_encoder import TargetData
+
+
+class RadarModel:
+    """Stateful radar simulator producing one frame per call to `tick()`."""
+
+    def __init__(self, cfg: SimConfig):
+        self.cfg = cfg
+        self._lock = threading.Lock()
+        self._frame_number: int = 0
+        self._next_pid: int = 1
+        self._persons: list[Person] = []
+        self._point_clouds: dict[int, list[RawPoint]] = {}  # pid → points
+
+        # Initialise starting population
+        for _ in range(cfg.initial_num_people):
+            self._add_person()
+
+    # ── Public commands (thread-safe) ───────────────────
+
+    def set_num_people(self, n: int):
+        """Adjust the population to exactly *n* people."""
+        n = max(0, min(n, 10))
+        with self._lock:
+            while len(self._persons) < n:
+                self._add_person()
+            while len(self._persons) > n:
+                self._persons.pop()
+
+    def trigger_fall(self, person_index: int = 0):
+        """Trigger a fall on a specific person (0-indexed)."""
+        with self._lock:
+            if 0 <= person_index < len(self._persons):
+                self._persons[person_index].trigger_fall()
+
+    def trigger_fall_random(self):
+        """Trigger a fall on a random person."""
+        with self._lock:
+            if self._persons:
+                p = random.choice(self._persons)
+                p.trigger_fall()
+
+    def get_person_count(self) -> int:
+        with self._lock:
+            return len(self._persons)
+
+    def get_persons_snapshot(self) -> list[dict]:
+        """Return a snapshot of person states for visualization."""
+        with self._lock:
+            return [
+                {
+                    "pid": p.pid,
+                    "x": p.x,
+                    "y": p.y,
+                    "z": p.z,
+                    "vx": p.vx,
+                    "vy": p.vy,
+                    "state": p.state.name,
+                    "target_x": p._target_x,
+                    "target_y": p._target_y,
+                }
+                for p in self._persons
+            ]
+
+    def get_point_clouds(self) -> dict[int, list[RawPoint]]:
+        """Return the last generated point clouds."""
+        with self._lock:
+            return dict(self._point_clouds)
+
+    # ── Frame generation ────────────────────────────────
+
+    def tick(self) -> Optional[tuple[int, list[TargetData]]]:
+        """
+        Advance one frame.
+
+        Returns (frame_number, [TargetData]) or None if this frame
+        should be "dropped" to simulate a real radar artifact.
+        """
+        dt = 1.0 / self.cfg.frame_rate
+
+        with self._lock:
+            self._frame_number += 1
+
+            # Dropped frame?
+            if random.random() < self.cfg.artifacts.drop_frame_probability:
+                return None
+
+            # Step all persons
+            for p in self._persons:
+                p.step(dt, self.cfg.room, self.cfg.person)
+
+            # Generate point clouds (for viz)
+            self._point_clouds.clear()
+            for p in self._persons:
+                self._point_clouds[p.pid] = generate_point_cloud(
+                    p,
+                    self.cfg.pointcloud,
+                    radar_x=self.cfg.radar.mount_x,
+                    radar_y=self.cfg.radar.mount_y,
+                    radar_z=self.cfg.radar.mount_z,
+                )
+
+            # Build tracked target list
+            targets: list[TargetData] = []
+            art = self.cfg.artifacts
+
+            for p in self._persons:
+                # Apply tracker measurement noise
+                noise_x = random.gauss(0, art.position_noise_sigma)
+                noise_y = random.gauss(0, art.position_noise_sigma)
+                noise_z = random.gauss(0, art.position_noise_sigma * 0.5)
+
+                vnoise_x = random.gauss(0, art.velocity_noise_sigma)
+                vnoise_y = random.gauss(0, art.velocity_noise_sigma)
+                vnoise_z = random.gauss(0, art.velocity_noise_sigma * 0.3)
+
+                z_val = p.z + noise_z
+                targets.append(TargetData(
+                    tid=p.pid,
+                    pos_x=p.x + noise_x,
+                    pos_y=p.y + noise_y,
+                    pos_z=z_val,
+                    vel_x=p.vx + vnoise_x,
+                    vel_y=p.vy + vnoise_y,
+                    vel_z=p.vz + vnoise_z,
+                    acc_x=p.ax,
+                    acc_y=p.ay,
+                    acc_z=p.az,
+                    conf=p.confidence + random.gauss(0, 0.03),
+                    has_height=True,
+                    min_z=max(0.0, z_val - random.uniform(0.2, 0.5)),
+                    max_z=z_val + random.uniform(0.2, 0.5),
+                ))
+
+            # Ghost targets
+            if random.random() < art.ghost_probability and len(targets) < 16:
+                n_ghosts = random.randint(1, min(art.ghost_max_count, 16 - len(targets)))
+                for g in range(n_ghosts):
+                    gx = random.uniform(self.cfg.room.x_min, self.cfg.room.x_max)
+                    gy = random.uniform(self.cfg.room.y_min, self.cfg.room.y_max)
+                    gz = random.uniform(0.3, 2.0)
+                    targets.append(TargetData(
+                        tid=100 + g,
+                        pos_x=gx,
+                        pos_y=gy,
+                        pos_z=gz,
+                        vel_x=random.gauss(0, 0.2),
+                        vel_y=random.gauss(0, 0.2),
+                        vel_z=0.0,
+                        conf=random.uniform(0.1, 0.4),  # low confidence
+                        has_height=False,
+                        min_z=gz,
+                        max_z=gz,
+                    ))
+
+            return (self._frame_number, targets)
+
+    # ── Internal helpers ────────────────────────────────
+
+    def _add_person(self):
+        p = create_person(self._next_pid, self.cfg.room, self.cfg.person)
+        self._persons.append(p)
+        self._next_pid += 1
+=== Linux/radar_simulator/config.py ===
+"""
+config.py — Central configuration for the radar simulator.
+
+All tuneable parameters in one place.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass, field
+
+
+@dataclass
+class RoomConfig:
+    """Room boundaries in metres (radar-centric coords)."""
+    x_min: float = 0.2
+    x_max: float = 6.0
+    y_min: float = -3.0
+    y_max: float = 3.0
+    z_floor: float = 0.0
+    z_ceiling: float = 2.8
+
+
+@dataclass
+class RadarConfig:
+    """Radar mount position and device identity."""
+    device_id: str = "simulator_radar"
+    mount_x: float = 0.0
+    mount_y: float = 0.0
+    mount_z: float = 2.5          # ceiling-mounted default
+
+
+@dataclass
+class MQTTConfig:
+    broker_host: str = "localhost"
+    broker_port: int = 1883
+    telemetry_topic: str = ""     # filled at runtime from device_id
+    availability_topic: str = ""  # filled at runtime from device_id
+    control_topic: str = "radar/simulator/control"
+    keepalive: int = 60
+
+    def apply_device_id(self, device_id: str):
+        self.telemetry_topic = f"linovt/{device_id}/telemetry"
+        self.availability_topic = f"linovt/{device_id}/availability"
+
+
+@dataclass
+class PersonConfig:
+    """Defaults for simulated person behaviour."""
+    speed_min: float = 0.2        # m/s
+    speed_max: float = 1.2        # m/s
+    standing_height_min: float = 1.2
+    standing_height_max: float = 1.8
+    stop_probability: float = 0.02       # per-frame chance of pausing
+    direction_change_prob: float = 0.015  # per-frame chance of new heading
+    stop_duration_min: float = 0.5       # seconds
+    stop_duration_max: float = 4.0       # seconds
+    fall_z_target: float = 0.15          # z when fallen
+    fall_duration: float = 0.6           # seconds to reach ground
+    fall_recovery_time: float = 8.0      # seconds before getting back up
+
+
+@dataclass
+class PointCloudConfig:
+    """Point cloud generation around each tracked person."""
+    min_points: int = 10
+    max_points: int = 30
+    xy_spread: float = 0.25       # σ (metres) around person centroid
+    z_spread: float = 0.15
+    snr_base: float = 15.0
+    snr_jitter: float = 5.0
+
+
+@dataclass
+class ArtifactConfig:
+    """Radar artifacts for realism."""
+    position_noise_sigma: float = 0.02   # metres of jitter on tracked pos
+    velocity_noise_sigma: float = 0.05   # m/s jitter
+    ghost_probability: float = 0.005     # per-frame chance of a ghost target
+    ghost_max_count: int = 2
+    drop_frame_probability: float = 0.003  # per-frame chance of skipping
+
+
+@dataclass
+class SimConfig:
+    """Top-level configuration combining everything."""
+    room: RoomConfig = field(default_factory=RoomConfig)
+    radar: RadarConfig = field(default_factory=RadarConfig)
+    mqtt: MQTTConfig = field(default_factory=MQTTConfig)
+    person: PersonConfig = field(default_factory=PersonConfig)
+    pointcloud: PointCloudConfig = field(default_factory=PointCloudConfig)
+    artifacts: ArtifactConfig = field(default_factory=ArtifactConfig)
+    frame_rate: int = 10
+    initial_num_people: int = 1
+    enable_visualization: bool = False
+
+    def __post_init__(self):
+        self.mqtt.apply_device_id(self.radar.device_id)
+=== Linux/radar_simulator/control_listener.py ===
+"""
+control_listener.py — Runtime control via MQTT (and optional stdin).
+
+Subscribes to ``radar/simulator/control`` and accepts JSON commands:
+
+    {"num_people": 3}          — set simulated person count
+    {"target": "simulator_radar_2", "num_people": 3}
+    {"simulate_fall": true}    — trigger a fall on a random person
+    {"target": "simulator_radar_2", "simulate_fall": true}
+    {"simulate_fall": 2}       — trigger fall on person index 2
+    {"targets": ["simulator_radar_1", "simulator_radar_3"], "frame_rate": 15}
+    {"frame_rate": 15}         — change frame rate live
+    {"room_width": 8}          — resize room X dimension
+    {"room_depth": 5}          — resize room Y dimension
+
+Target selectors:
+    target / radar_id / device_id  (single radar)
+    targets                         (list of radars)
+If omitted, command applies to all simulated radars.
+
+Also spawns a background stdin reader so you can type commands in
+the terminal:
+
+    p3        — set 3 people
+    p3 r2     — set 3 people on radar r2
+    fall      — trigger random fall
+    fall r2   — trigger random fall on radar r2
+    fall 1    — trigger fall on person 1
+    fps 20 r2 — set fps to 20 on radar r2
+    roomw 8 r2
+    roomd 5 r2
+    list      — show radar IDs
+    quit      — stop simulator
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import threading
+import sys
+from typing import Any
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .radar_model import RadarModel
+    from .mqtt_client import SimulatorMQTTClient
+    from .config import SimConfig
+
+logger = logging.getLogger(__name__)
+
+
+class ControlListener:
+    """Listens for runtime commands via MQTT and stdin."""
+
+    def __init__(
+        self,
+        mqtt_client: "SimulatorMQTTClient",
+        model: "RadarModel" | None = None,
+        cfg: "SimConfig" | None = None,
+        models: list["RadarModel"] | None = None,
+        cfgs: list["SimConfig"] | None = None,
+        on_quit: threading.Event | None = None,
+    ):
+        self.mqtt_client = mqtt_client
+        self.models = models if models else ([] if model is None else [model])
+        self.cfgs = cfgs if cfgs else ([] if cfg is None else [cfg])
+        if not self.models:
+            raise ValueError("ControlListener requires at least one model")
+        if not self.cfgs:
+            raise ValueError("ControlListener requires at least one config")
+
+        self._model_by_id: dict[str, RadarModel] = {}
+        self._cfg_by_id: dict[str, SimConfig] = {}
+        for m, c in zip(self.models, self.cfgs):
+            did = c.radar.device_id
+            self._model_by_id[did] = m
+            self._cfg_by_id[did] = c
+
+        self._quit_event = on_quit or threading.Event()
+
+    @property
+    def quit_event(self) -> threading.Event:
+        return self._quit_event
+
+    def start(self):
+        """Subscribe to MQTT control topic and start stdin thread."""
+        control_topic = self.cfgs[0].mqtt.control_topic
+        self.mqtt_client.subscribe(
+            control_topic, self._on_mqtt_control
+        )
+        logger.info("Control listening on MQTT topic: %s", control_topic)
+
+        if sys.stdin and sys.stdin.isatty():
+            t = threading.Thread(target=self._stdin_loop, daemon=True)
+            t.start()
+            logger.info(
+                "Stdin controls: p<N> [radar] | fall [idx] [radar] | fps <n> [radar] | roomw/roomd <n> [radar] | list | quit"
+            )
+        else:
+            logger.info("Stdin controls disabled (non-interactive session)")
+
+    # ── MQTT handler ────────────────────────────────────
+
+    def _on_mqtt_control(self, client, userdata, msg):
+        try:
+            payload = json.loads(msg.payload.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            logger.warning("Bad control payload: %r", msg.payload)
+            return
+
+        self._handle_command(payload)
+
+    # ── Stdin handler ───────────────────────────────────
+
+    def _stdin_loop(self):
+        """Blocking readline loop on stdin (daemon thread)."""
+        try:
+            while not self._quit_event.is_set():
+                try:
+                    line = input()
+                except EOFError:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+
+                parts = line.split()
+                cmd = parts[0].lower()
+
+                if cmd == "quit" or cmd == "q":
+                    logger.info("Quit requested via stdin")
+                    self._quit_event.set()
+                    break
+
+                if cmd == "list":
+                    logger.info("Known radars: %s", ", ".join(self._model_by_id.keys()))
+                    continue
+
+                if cmd.startswith("p") and cmd[1:].isdigit():
+                    n = int(cmd[1:])
+                    payload: dict[str, Any] = {"num_people": n}
+                    if len(parts) >= 2:
+                        payload["target"] = self._token_to_target(parts[1])
+                    self._handle_command(payload)
+                    continue
+
+                if cmd == "fall":
+                    if len(parts) == 1:
+                        self._handle_command({"simulate_fall": True})
+                        continue
+
+                    payload: dict[str, Any]
+                    target_token_index = 1
+                    if parts[1].isdigit():
+                        payload = {"simulate_fall": int(parts[1])}
+                        target_token_index = 2
+                    else:
+                        payload = {"simulate_fall": True}
+
+                    if len(parts) > target_token_index:
+                        payload["target"] = self._token_to_target(parts[target_token_index])
+                    self._handle_command(payload)
+                    continue
+
+                if cmd == "fps" and len(parts) >= 2 and parts[1].isdigit():
+                    payload = {"frame_rate": int(parts[1])}
+                    if len(parts) >= 3:
+                        payload["target"] = self._token_to_target(parts[2])
+                    self._handle_command(payload)
+                    continue
+
+                if cmd in {"roomw", "room_width"} and len(parts) >= 2:
+                    try:
+                        width = float(parts[1])
+                    except ValueError:
+                        width = None
+                    if width is not None:
+                        payload = {"room_width": width}
+                        if len(parts) >= 3:
+                            payload["target"] = self._token_to_target(parts[2])
+                        self._handle_command(payload)
+                        continue
+
+                if cmd in {"roomd", "room_depth"} and len(parts) >= 2:
+                    try:
+                        depth = float(parts[1])
+                    except ValueError:
+                        depth = None
+                    if depth is not None:
+                        payload = {"room_depth": depth}
+                        if len(parts) >= 3:
+                            payload["target"] = self._token_to_target(parts[2])
+                        self._handle_command(payload)
+                        continue
+
+                logger.info("Unknown command: %s", line)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _token_to_target(token: str) -> str:
+        token = token.strip()
+        if token.startswith("@"):
+            token = token[1:]
+        return token
+
+    def _resolve_target_ids(self, cmd: dict) -> list[str]:
+        """Resolve radar IDs from command selectors; default is all radars."""
+        known_ids = list(self._model_by_id.keys())
+        selectors: list[str] = []
+
+        for key in ("target", "radar_id", "device_id"):
+            value = cmd.get(key)
+            if isinstance(value, str) and value.strip():
+                selectors.append(value.strip())
+
+        targets_val = cmd.get("targets")
+        if isinstance(targets_val, list):
+            selectors.extend(str(v).strip() for v in targets_val if str(v).strip())
+        elif isinstance(targets_val, str):
+            selectors.extend(v.strip() for v in targets_val.split(",") if v.strip())
+
+        if not selectors:
+            return known_ids
+
+        resolved: list[str] = []
+        for selector in selectors:
+            if selector.lower() in {"all", "*"}:
+                return known_ids
+            if selector in self._model_by_id and selector not in resolved:
+                resolved.append(selector)
+
+        if not resolved:
+            logger.warning("No matching radar target for command selectors: %s", selectors)
+
+        return resolved
+
+    def _resolve_models(self, target_ids: list[str]) -> list[tuple[str, RadarModel]]:
+        return [(did, self._model_by_id[did]) for did in target_ids if did in self._model_by_id]
+
+    def _resolve_cfgs(self, target_ids: list[str]) -> list[tuple[str, SimConfig]]:
+        return [(did, self._cfg_by_id[did]) for did in target_ids if did in self._cfg_by_id]
+
+    # ── Command dispatch ────────────────────────────────
+
+    def _handle_command(self, cmd: dict):
+        target_ids = self._resolve_target_ids(cmd)
+
+        if "num_people" in cmd:
+            n = int(cmd["num_people"])
+            selected_models = self._resolve_models(target_ids)
+            for _, model in selected_models:
+                model.set_num_people(n)
+            logger.info(
+                "▸ People set to %d on %d radar(s): %s",
+                n,
+                len(selected_models),
+                ", ".join(did for did, _ in selected_models),
+            )
+
+        if "simulate_fall" in cmd:
+            val = cmd["simulate_fall"]
+            selected_models = self._resolve_models(target_ids)
+            if isinstance(val, bool) and val:
+                for _, model in selected_models:
+                    model.trigger_fall_random()
+                logger.info(
+                    "▸ Fall triggered (random person) on %d radar(s): %s",
+                    len(selected_models),
+                    ", ".join(did for did, _ in selected_models),
+                )
+            elif isinstance(val, int):
+                for _, model in selected_models:
+                    model.trigger_fall(val)
+                logger.info(
+                    "▸ Fall triggered (person %d) on %d radar(s): %s",
+                    val,
+                    len(selected_models),
+                    ", ".join(did for did, _ in selected_models),
+                )
+
+        if "frame_rate" in cmd:
+            fps = max(1, min(60, int(cmd["frame_rate"])))
+            selected_cfgs = self._resolve_cfgs(target_ids)
+            for _, cfg in selected_cfgs:
+                cfg.frame_rate = fps
+            logger.info(
+                "▸ Frame rate set to %d fps on %d radar(s): %s",
+                fps,
+                len(selected_cfgs),
+                ", ".join(did for did, _ in selected_cfgs),
+            )
+
+        if "room_width" in cmd:
+            w = float(cmd["room_width"])
+            selected_cfgs = self._resolve_cfgs(target_ids)
+            for _, cfg in selected_cfgs:
+                cfg.room.x_max = w
+            logger.info(
+                "▸ Room width (x_max) set to %.1f on %d radar(s): %s",
+                w,
+                len(selected_cfgs),
+                ", ".join(did for did, _ in selected_cfgs),
+            )
+
+        if "room_depth" in cmd:
+            d = float(cmd["room_depth"])
+            half = d / 2.0
+            selected_cfgs = self._resolve_cfgs(target_ids)
+            for _, cfg in selected_cfgs:
+                cfg.room.y_min = -half
+                cfg.room.y_max = half
+            logger.info(
+                "▸ Room depth (y range) set to ±%.1f on %d radar(s): %s",
+                half,
+                len(selected_cfgs),
+                ", ".join(did for did, _ in selected_cfgs),
+            )
+=== Linux/radar_simulator/mqtt_client.py ===
+"""
+mqtt_client.py — MQTT connection wrapper for the simulator.
+
+Handles:
+  • connecting to the broker
+  • publishing telemetry frames (binary protobuf)
+  • publishing availability (online / offline)
+  • last-will testament for clean disconnects
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+import uuid
+
+import paho.mqtt.client as mqtt
+
+from .config import MQTTConfig
+
+logger = logging.getLogger(__name__)
+
+
+class SimulatorMQTTClient:
+    """Thin wrapper around paho-mqtt for simulator use."""
+
+    def __init__(self, cfg: MQTTConfig):
+        self.cfg = cfg
+        unique_suffix = uuid.uuid4().hex[:8]
+        self._client = mqtt.Client(
+            client_id=f"radar_sim_{int(time.time()) % 100000}_{unique_suffix}",
+            protocol=mqtt.MQTTv311,
+            clean_session=True,
+        )
+        self._client.on_connect = self._on_connect
+        self._client.on_disconnect = self._on_disconnect
+        self._connected = False
+
+        # Last-will: mark offline if simulator crashes
+        self._client.will_set(
+            cfg.availability_topic,
+            "offline",
+            qos=0,
+            retain=True,
+        )
+
+    # ── Lifecycle ───────────────────────────────────────
+
+    def connect(self):
+        """Connect to broker (blocking until CONNACK)."""
+        logger.info(
+            "Connecting to MQTT broker %s:%d …",
+            self.cfg.broker_host,
+            self.cfg.broker_port,
+        )
+        self._client.connect(
+            self.cfg.broker_host,
+            self.cfg.broker_port,
+            keepalive=self.cfg.keepalive,
+        )
+        self._client.loop_start()
+
+        # Wait for CONNACK (up to 5 s)
+        deadline = time.time() + 5.0
+        while not self._connected and time.time() < deadline:
+            time.sleep(0.05)
+        if not self._connected:
+            raise ConnectionError("MQTT CONNACK not received within 5 s")
+
+    def disconnect(self):
+        """Graceful disconnect: publish offline, then close."""
+        try:
+            self._client.publish(
+                self.cfg.availability_topic, "offline", qos=0, retain=True
+            )
+            time.sleep(0.15)  # let message drain
+        except Exception:
+            pass
+        self._client.loop_stop()
+        self._client.disconnect()
+        self._connected = False
+        logger.info("MQTT disconnected")
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    # ── Publishing ──────────────────────────────────────
+
+    def publish_telemetry(self, payload: bytes):
+        """Publish a binary protobuf frame."""
+        if not self._connected:
+            return
+        self._client.publish(
+            self.cfg.telemetry_topic, payload, qos=0, retain=False
+        )
+
+    def publish_availability(self, status: str = "online"):
+        if not self._connected:
+            return
+        self._client.publish(
+            self.cfg.availability_topic, status, qos=0, retain=True
+        )
+
+    def subscribe(self, topic: str, callback):
+        """Subscribe to a topic and register a callback."""
+        self._client.subscribe(topic, qos=0)
+        self._client.message_callback_add(topic, callback)
+
+    # ── Callbacks ───────────────────────────────────────
+
+    def _on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            self._connected = True
+            logger.info(
+                "MQTT connected  →  telemetry on %s", self.cfg.telemetry_topic
+            )
+            self.publish_availability("online")
+        else:
+            logger.error("MQTT connection refused: rc=%d", rc)
+
+    def _on_disconnect(self, client, userdata, rc):
+        self._connected = False
+        if rc != 0:
+            logger.warning("MQTT unexpected disconnect: rc=%d", rc)
+=== Linux/radar_simulator/__main__.py ===
+"""Allow running as: python -m radar_simulator"""
+from .main import main
+
+main()
+=== Linux/radar_simulator/__init__.py ===
+# radar_simulator — mmWave radar telemetry simulator
+=== Linux/radar_simulator/visualizer.py ===
+"""
+visualizer.py — Real-time matplotlib debug view of the simulated radar scene.
+
+Shows:
+  • Room boundaries
+  • Person positions (coloured by state)
+  • Waypoint arrows
+  • Point cloud scatter (low alpha)
+  • Live stats (frame #, person count, states)
+
+Run the simulator with --viz to enable.
+
+The visualizer runs in a separate thread and polls the RadarModel for
+snapshots, so it never blocks the main publish loop.
+"""
+
+from __future__ import annotations
+
+import threading
+import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .radar_model import RadarModel
+    from .config import SimConfig
+
+# Guard matplotlib import — only crash if actually used
+_MPL_AVAILABLE = False
+try:
+    import matplotlib
+    matplotlib.use("TkAgg")  # non-blocking backend
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    from matplotlib.collections import PathCollection
+    _MPL_AVAILABLE = True
+except ImportError:
+    pass
+
+
+# Colour map for person states
+_STATE_COLOURS = {
+    "WALKING": "#2196F3",
+    "STOPPED": "#FF9800",
+    "FALLING": "#F44336",
+    "FALLEN": "#B71C1C",
+    "RECOVERING": "#9C27B0",
+}
+
+
+class Visualizer:
+    """Non-blocking matplotlib visualizer (runs in its own thread)."""
+
+    def __init__(self, model: "RadarModel", cfg: "SimConfig"):
+        if not _MPL_AVAILABLE:
+            raise ImportError(
+                "matplotlib is required for visualization. "
+                "Install it:  pip install matplotlib"
+            )
+        self.model = model
+        self.cfg = cfg
+        self._running = False
+
+    def start(self):
+        """Launch the visualizer (must be called from main thread on macOS)."""
+        self._running = True
+        self._run()
+
+    def start_threaded(self):
+        """Launch in a background thread (Linux only — TkAgg needs main thread on macOS)."""
+        t = threading.Thread(target=self._run, daemon=True)
+        t.start()
+
+    def stop(self):
+        self._running = False
+
+    # ── Main draw loop ──────────────────────────────────
+
+    def _run(self):
+        room = self.cfg.room
+        fig, (ax_top, ax_side) = plt.subplots(
+            1, 2, figsize=(14, 6),
+            gridspec_kw={"width_ratios": [2, 1]},
+        )
+        fig.suptitle("Radar Simulator — Debug View", fontsize=13)
+        plt.ion()
+
+        while self._running:
+            persons = self.model.get_persons_snapshot()
+            clouds = self.model.get_point_clouds()
+
+            # ── Top-down view (X-Y) ────────────────────
+            ax_top.clear()
+            ax_top.set_xlim(room.x_min - 0.5, room.x_max + 0.5)
+            ax_top.set_ylim(room.y_min - 0.5, room.y_max + 0.5)
+            ax_top.set_aspect("equal")
+            ax_top.set_xlabel("X (m)")
+            ax_top.set_ylabel("Y (m)")
+            ax_top.set_title("Top-Down View")
+
+            # Room rectangle
+            rect = patches.Rectangle(
+                (room.x_min, room.y_min),
+                room.x_max - room.x_min,
+                room.y_max - room.y_min,
+                linewidth=2, edgecolor="#555", facecolor="#1a1a2e", alpha=0.3,
+            )
+            ax_top.add_patch(rect)
+
+            # Radar position
+            ax_top.plot(
+                self.cfg.radar.mount_x, self.cfg.radar.mount_y,
+                marker="^", color="lime", markersize=12, zorder=10,
+            )
+
+            # Point clouds
+            for pid, pts in clouds.items():
+                xs = [p.x for p in pts]
+                ys = [p.y for p in pts]
+                ax_top.scatter(xs, ys, s=3, alpha=0.15, color="#888")
+
+            # Persons
+            for p in persons:
+                colour = _STATE_COLOURS.get(p["state"], "#FFF")
+                ax_top.plot(
+                    p["x"], p["y"],
+                    "o", color=colour, markersize=12, zorder=5,
+                    markeredgecolor="white", markeredgewidth=0.5,
+                )
+                ax_top.annotate(
+                    f'{p["pid"]}',
+                    (p["x"], p["y"]),
+                    textcoords="offset points", xytext=(6, 6),
+                    fontsize=8, color="white",
+                    bbox=dict(boxstyle="round,pad=0.2", fc=colour, alpha=0.7),
+                )
+                # Waypoint arrow
+                ax_top.annotate(
+                    "",
+                    xy=(p["target_x"], p["target_y"]),
+                    xytext=(p["x"], p["y"]),
+                    arrowprops=dict(arrowstyle="->", color=colour, alpha=0.4, lw=0.8),
+                )
+
+            # Legend
+            labels = []
+            for p in persons:
+                v = (p["vx"] ** 2 + p["vy"] ** 2) ** 0.5
+                labels.append(f'P{p["pid"]}: {p["state"]}  v={v:.2f} m/s  z={p["z"]:.2f}')
+            ax_top.text(
+                room.x_min + 0.1, room.y_max + 0.3,
+                "  |  ".join(labels) if labels else "No people",
+                fontsize=7, color="#ccc",
+            )
+
+            # ── Side view (X-Z) ────────────────────────
+            ax_side.clear()
+            ax_side.set_xlim(room.x_min - 0.5, room.x_max + 0.5)
+            ax_side.set_ylim(-0.2, room.z_ceiling + 0.3)
+            ax_side.set_xlabel("X (m)")
+            ax_side.set_ylabel("Z (m)")
+            ax_side.set_title("Side View (X-Z)")
+
+            # Floor line
+            ax_side.axhline(y=0, color="#555", linestyle="--", linewidth=0.5)
+
+            # Radar position
+            ax_side.plot(
+                self.cfg.radar.mount_x, self.cfg.radar.mount_z,
+                marker="v", color="lime", markersize=12, zorder=10,
+            )
+
+            for p in persons:
+                colour = _STATE_COLOURS.get(p["state"], "#FFF")
+                ax_side.plot(
+                    p["x"], p["z"],
+                    "o", color=colour, markersize=10, zorder=5,
+                    markeredgecolor="white", markeredgewidth=0.5,
+                )
+                ax_side.annotate(
+                    f'P{p["pid"]}',
+                    (p["x"], p["z"]),
+                    textcoords="offset points", xytext=(6, 4),
+                    fontsize=8, color=colour,
+                )
+
+            fig.canvas.draw_idle()
+            fig.canvas.flush_events()
+
+            try:
+                plt.pause(0.1)
+            except Exception:
+                break
+
+        plt.close(fig)
+=== Linux/radar_simulator/main.py ===
+#!/usr/bin/env python3
+"""
+main.py — Entry point for the mmWave radar simulator.
+
+Usage:
+    python -m radar_simulator                          # basic run
+    python -m radar_simulator --people 3               # start with 3 people
+    python -m radar_simulator --viz                    # enable matplotlib view
+    python -m radar_simulator --broker 10.10.128.175   # custom broker
+    python -m radar_simulator --device-id 48e7298d2838 # mimic a real device
+    python -m radar_simulator --fps 15                 # 15 Hz
+
+Runtime controls (type in terminal):
+    p3        set 3 people
+    p3 radar_2
+    fall      trigger random fall
+    fall radar_2
+    fall 0    trigger fall on person 0
+    fall 0 radar_2
+    fps 20    set frame rate to 20
+    fps 20 radar_2
+    roomw 8 radar_2
+    roomd 5 radar_2
+    list      show known radar IDs
+    quit      stop
+
+MQTT runtime controls (publish JSON to radar/simulator/control):
+    {"num_people": 3}
+    {"target": "simulator_radar_2", "num_people": 3}
+    {"simulate_fall": true}
+    {"target": "simulator_radar_2", "simulate_fall": true}
+    {"targets": ["simulator_radar_1", "simulator_radar_3"], "simulate_fall": 0}
+    {"frame_rate": 15}
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import logging
+import signal
+import sys
+import threading
+import time
+
+from .config import SimConfig
+from .radar_model import RadarModel
+from .protobuf_encoder import encode_radar_message
+from .mqtt_client import SimulatorMQTTClient
+from .control_listener import ControlListener
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-5s  %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="mmWave radar telemetry simulator",
+    )
+    p.add_argument("--broker", default="localhost", help="MQTT broker host")
+    p.add_argument("--port", type=int, default=1883, help="MQTT broker port")
+    p.add_argument("--device-id", default="simulator_radar", help="Radar device ID used in topic")
+    p.add_argument("--radars", type=int, default=1, help="Number of simulated radars to publish")
+    p.add_argument(
+        "--device-id-prefix",
+        default="simulator_radar",
+        help="Device ID prefix when --radars > 1 (e.g. simulator_radar_1)",
+    )
+    p.add_argument(
+        "--device-ids",
+        default="",
+        help="Comma-separated explicit device IDs (overrides --radars and prefix)",
+    )
+    p.add_argument("--people", type=int, default=1, help="Initial number of simulated people")
+    p.add_argument("--fps", type=int, default=10, help="Frames per second")
+    p.add_argument("--room-width", type=float, default=6.0, help="Room X dimension (m)")
+    p.add_argument("--room-depth", type=float, default=6.0, help="Room Y dimension (m)")
+    p.add_argument("--radar-height", type=float, default=2.5, help="Radar mount height (m)")
+    p.add_argument("--viz", action="store_true", help="Enable matplotlib debug visualization")
+    p.add_argument("--no-artifacts", action="store_true", help="Disable ghost/noise/drop artifacts")
+    p.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
+    return p.parse_args()
+
+
+def build_config(args: argparse.Namespace) -> SimConfig:
+    cfg = SimConfig()
+
+    # MQTT
+    cfg.mqtt.broker_host = args.broker
+    cfg.mqtt.broker_port = args.port
+    cfg.radar.device_id = args.device_id
+    cfg.mqtt.apply_device_id(args.device_id)
+
+    # Room
+    cfg.room.x_min = 0.2
+    cfg.room.x_max = args.room_width
+    half_depth = args.room_depth / 2.0
+    cfg.room.y_min = -half_depth
+    cfg.room.y_max = half_depth
+
+    # Radar
+    cfg.radar.mount_z = args.radar_height
+
+    # Simulation
+    cfg.frame_rate = args.fps
+    cfg.initial_num_people = args.people
+    cfg.enable_visualization = args.viz
+
+    # Artifacts
+    if args.no_artifacts:
+        cfg.artifacts.ghost_probability = 0.0
+        cfg.artifacts.drop_frame_probability = 0.0
+        cfg.artifacts.position_noise_sigma = 0.0
+        cfg.artifacts.velocity_noise_sigma = 0.0
+
+    return cfg
+
+
+def resolve_device_ids(args: argparse.Namespace) -> list[str]:
+    """Resolve radar device IDs for one or many simulated radars."""
+    if args.device_ids.strip():
+        seen: set[str] = set()
+        ids: list[str] = []
+        for raw in args.device_ids.split(","):
+            did = raw.strip()
+            if not did or did in seen:
+                continue
+            ids.append(did)
+            seen.add(did)
+        if ids:
+            return ids
+
+    if args.radars <= 1:
+        return [args.device_id]
+
+    prefix = args.device_id_prefix.strip() or "simulator_radar"
+    return [f"{prefix}_{idx + 1}" for idx in range(args.radars)]
+
+
+def main():
+    args = parse_args()
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    base_cfg = build_config(args)
+    device_ids = resolve_device_ids(args)
+
+    simulators: list[dict] = []
+    for device_id in device_ids:
+        cfg = copy.deepcopy(base_cfg)
+        cfg.radar.device_id = device_id
+        cfg.mqtt.apply_device_id(device_id)
+        model = RadarModel(cfg)
+        mqtt_client = SimulatorMQTTClient(cfg.mqtt)
+        simulators.append(
+            {
+                "device_id": device_id,
+                "cfg": cfg,
+                "model": model,
+                "mqtt_client": mqtt_client,
+            }
+        )
+
+    if not simulators:
+        logger.error("No radar IDs resolved. Nothing to run.")
+        sys.exit(1)
+
+    primary = simulators[0]
+    primary_cfg: SimConfig = primary["cfg"]
+    primary_mqtt: SimulatorMQTTClient = primary["mqtt_client"]
+
+    # ── Banner ──────────────────────────────────────────
+    print("=" * 62)
+    print("  mmWave Radar Simulator")
+    print(f"  Broker:    {primary_cfg.mqtt.broker_host}:{primary_cfg.mqtt.broker_port}")
+    print(f"  Radars:    {len(simulators)}")
+    if len(simulators) == 1:
+        print(f"  Device ID: {primary_cfg.radar.device_id}")
+        print(f"  Topic:     {primary_cfg.mqtt.telemetry_topic}")
+    else:
+        print("  Topics:")
+        for sim in simulators:
+            cfg: SimConfig = sim["cfg"]
+            print(f"    - {cfg.radar.device_id}: {cfg.mqtt.telemetry_topic}")
+    print(f"  FPS:       {primary_cfg.frame_rate}")
+    print(f"  People:    {primary_cfg.initial_num_people}")
+    print(f"  Room:      {primary_cfg.room.x_max:.1f} × {primary_cfg.room.y_max - primary_cfg.room.y_min:.1f} m")
+    print(f"  Radar Z:   {primary_cfg.radar.mount_z:.1f} m")
+    print(f"  Viz:       {'ON' if primary_cfg.enable_visualization else 'OFF'}")
+    print("=" * 62)
+
+    # ── Create control coordination ──────────────────────
+    quit_event = threading.Event()
+    control = ControlListener(
+        mqtt_client=primary_mqtt,
+        models=[sim["model"] for sim in simulators],
+        cfgs=[sim["cfg"] for sim in simulators],
+        on_quit=quit_event,
+    )
+
+    # Handle Ctrl-C
+    def _sigint(sig, frame):
+        logger.info("SIGINT — shutting down")
+        quit_event.set()
+    signal.signal(signal.SIGINT, _sigint)
+
+    # ── Connect MQTT ────────────────────────────────────
+    connected_clients: list[SimulatorMQTTClient] = []
+    try:
+        for sim in simulators:
+            client: SimulatorMQTTClient = sim["mqtt_client"]
+            client.connect()
+            connected_clients.append(client)
+    except ConnectionError as e:
+        logger.error("Could not connect to MQTT: %s", e)
+        for client in connected_clients:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+        sys.exit(1)
+
+    # ── Start control listener ──────────────────────────
+    control.start()
+
+    # ── Optional visualizer ─────────────────────────────
+    viz = None
+    viz_thread = None
+    if primary_cfg.enable_visualization:
+        try:
+            from .visualizer import Visualizer
+            if len(simulators) > 1:
+                logger.info(
+                    "Visualization enabled for primary radar only: %s",
+                    primary_cfg.radar.device_id,
+                )
+            viz = Visualizer(primary["model"], primary_cfg)
+            # On Linux we can use a background thread
+            viz_thread = threading.Thread(target=viz.start, daemon=True)
+            viz_thread.start()
+            logger.info("Visualizer started")
+        except ImportError as e:
+            logger.warning("Visualization unavailable: %s", e)
+
+    # ── Main publish loop ───────────────────────────────
+    frame_count = 0
+    bytes_total = 0
+    last_stats = time.time()
+
+    logger.info(
+        "Publishing radar stream(s) for %d radar(s) …  (type 'quit' or Ctrl-C to stop)",
+        len(simulators),
+    )
+
+    try:
+        while not quit_event.is_set():
+            loop_start = time.time()
+            dt = 1.0 / max(1, primary_cfg.frame_rate)
+
+            for sim in simulators:
+                model: RadarModel = sim["model"]
+                mqtt_client: SimulatorMQTTClient = sim["mqtt_client"]
+                device_id: str = sim["device_id"]
+
+                result = model.tick()
+
+                if result is not None:
+                    frame_num, targets = result
+                    payload = encode_radar_message(frame_num, targets)
+                    mqtt_client.publish_telemetry(payload)
+                    frame_count += 1
+                    bytes_total += len(payload)
+
+                    if logger.isEnabledFor(logging.DEBUG) and frame_count <= 3:
+                        logger.debug(
+                            "[%s] Frame %d: %d targets, %d bytes  hex=%s",
+                            device_id,
+                            frame_num,
+                            len(targets),
+                            len(payload),
+                            payload.hex()[:120],
+                        )
+                else:
+                    logger.debug("[%s] Frame dropped (artifact)", device_id)
+
+            # Periodic stats (every 5 s)
+            now = time.time()
+            if now - last_stats >= 5.0:
+                fps_actual = frame_count / (now - last_stats) if (now - last_stats) > 0 else 0
+                people_snapshot = ", ".join(
+                    f"{sim['device_id']}={sim['model'].get_person_count()}"
+                    for sim in simulators
+                )
+                logger.info(
+                    "[ %d frames | %.1f fps | %d radars | people(%s) | %.1f KB published ]",
+                    frame_count,
+                    fps_actual,
+                    len(simulators),
+                    people_snapshot,
+                    bytes_total / 1024,
+                )
+                frame_count = 0
+                bytes_total = 0
+                last_stats = now
+
+            # Pace to target FPS
+            elapsed = time.time() - loop_start
+            sleep_time = dt - elapsed
+            if sleep_time > 0:
+                # Use quit_event.wait so we wake up on quit
+                quit_event.wait(sleep_time)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        logger.info("Shutting down …")
+        if viz:
+            viz.stop()
+        for sim in simulators:
+            try:
+                sim["mqtt_client"].disconnect()
+            except Exception:
+                pass
+        logger.info("Done.")
+
+
+if __name__ == "__main__":
+    main()
+=== Linux/radar_simulator/protobuf_encoder.py ===
+"""
+protobuf_encoder.py — Nanopb-compatible protobuf encoder.
+
+Encodes radar telemetry in the EXACT wire format produced by the ESP32
+firmware using nanopb.  Every field uses wire type 2 (length-delimited bytes)
+with a fixed 4-byte little-endian payload (or 1 byte for booleans).
+
+Proto schema (for reference):
+  message Target {
+      bytes tid      = 1;   // uint32 LE
+      bytes posX     = 2;   // float LE
+      bytes posY     = 3;
+      bytes posZ     = 4;
+      bytes velX     = 5;
+      bytes velY     = 6;
+      bytes velZ     = 7;
+      bytes accX     = 8;
+      bytes accY     = 9;
+      bytes accZ     = 10;
+      bytes conf     = 11;  // float LE
+      bytes has_height = 12; // 1 byte bool
+      bytes minZ     = 13;  // float LE
+      bytes maxZ     = 14;  // float LE
+  }
+  message RadarMessage {
+      bytes frame_number = 1;  // uint32 LE
+      repeated Target targets = 2;
+  }
+"""
+
+from __future__ import annotations
+
+import struct
+from dataclasses import dataclass
+
+
+# ── Low-level wire helpers ──────────────────────────────────
+
+def _varint(value: int) -> bytes:
+    """Encode an unsigned varint."""
+    buf = bytearray()
+    while value > 0x7F:
+        buf.append((value & 0x7F) | 0x80)
+        value >>= 7
+    buf.append(value & 0x7F)
+    return bytes(buf)
+
+
+def _tag(field_num: int, wire_type: int = 2) -> bytes:
+    """Encode a protobuf field tag.  Default wire_type=2 (LEN)."""
+    return _varint((field_num << 3) | wire_type)
+
+
+def _len_field(field_num: int, data: bytes) -> bytes:
+    """Tag + length + payload for a wire-type-2 field."""
+    return _tag(field_num) + _varint(len(data)) + data
+
+
+def _float_le(value: float) -> bytes:
+    return struct.pack('<f', value)
+
+
+def _uint32_le(value: int) -> bytes:
+    return struct.pack('<I', value & 0xFFFFFFFF)
+
+
+def _bool_byte(value: bool) -> bytes:
+    return b'\x01' if value else b'\x00'
+
+
+# ── Public dataclasses ──────────────────────────────────────
+
+@dataclass(slots=True)
+class TargetData:
+    """All fields needed for one tracked target."""
+    tid: int = 0
+    pos_x: float = 0.0
+    pos_y: float = 0.0
+    pos_z: float = 0.0
+    vel_x: float = 0.0
+    vel_y: float = 0.0
+    vel_z: float = 0.0
+    acc_x: float = 0.0
+    acc_y: float = 0.0
+    acc_z: float = 0.0
+    conf: float = 0.85
+    has_height: bool = True
+    min_z: float = 0.0
+    max_z: float = 2.5
+
+
+def encode_target(t: TargetData) -> bytes:
+    """Encode a single Target sub-message (inner bytes, no outer tag)."""
+    return (
+        _len_field(1,  _uint32_le(t.tid))
+        + _len_field(2,  _float_le(t.pos_x))
+        + _len_field(3,  _float_le(t.pos_y))
+        + _len_field(4,  _float_le(t.pos_z))
+        + _len_field(5,  _float_le(t.vel_x))
+        + _len_field(6,  _float_le(t.vel_y))
+        + _len_field(7,  _float_le(t.vel_z))
+        + _len_field(8,  _float_le(t.acc_x))
+        + _len_field(9,  _float_le(t.acc_y))
+        + _len_field(10, _float_le(t.acc_z))
+        + _len_field(11, _float_le(t.conf))
+        + _len_field(12, _bool_byte(t.has_height))
+        + _len_field(13, _float_le(t.min_z))
+        + _len_field(14, _float_le(t.max_z))
+    )
+
+
+def encode_radar_message(frame_number: int, targets: list[TargetData]) -> bytes:
+    """
+    Encode a full RadarMessage.
+
+    Wire layout:
+      field 1 (LEN) : 4-byte uint32 LE frame_number
+      field 2 (LEN) : Target sub-message   (repeated — each one tagged separately)
+    """
+    buf = _len_field(1, _uint32_le(frame_number))
+    for t in targets:
+        inner = encode_target(t)
+        buf += _len_field(2, inner)
+    return buf
+=== Linux/radar_simulator/pointcloud_generator.py ===
+"""
+pointcloud_generator.py — Radar point cloud generation.
+
+Each tracked person produces a cluster of 10–30 noisy radar detection
+points, simulating what the raw mmWave point cloud looks like before
+the tracker fuses them into a single Target.
+
+These points are used for:
+  • the optional debug visualizer
+  • more realistic noise injection into the tracked target output
+
+The protobuf output only carries *tracked targets* (one per person),
+not the raw point cloud.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from dataclasses import dataclass
+
+from .config import PointCloudConfig
+from .person_model import Person
+
+
+@dataclass(slots=True)
+class RawPoint:
+    """One raw radar detection point."""
+    x: float
+    y: float
+    z: float
+    velocity: float      # radial velocity seen by radar
+    snr: float           # signal-to-noise ratio (dB)
+
+
+def generate_point_cloud(
+    person: Person,
+    cfg: PointCloudConfig,
+    radar_x: float = 0.0,
+    radar_y: float = 0.0,
+    radar_z: float = 2.5,
+) -> list[RawPoint]:
+    """
+    Generate a cluster of noisy detection points around *person*.
+
+    Points are scattered with Gaussian noise around the person's centroid
+    and assigned realistic SNR values.  Radial velocity is projected
+    along the line from the radar to each point.
+    """
+    n = random.randint(cfg.min_points, cfg.max_points)
+    points: list[RawPoint] = []
+
+    # Person's velocity vector
+    vx, vy, vz = person.vx, person.vy, person.vz
+
+    for _ in range(n):
+        # Scattered position
+        px = person.x + random.gauss(0, cfg.xy_spread)
+        py = person.y + random.gauss(0, cfg.xy_spread)
+        pz = person.z + random.gauss(0, cfg.z_spread)
+        pz = max(0.0, pz)
+
+        # Radial velocity: project velocity onto radar→point unit vector
+        dx = px - radar_x
+        dy = py - radar_y
+        dz = pz - radar_z
+        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if dist > 0.01:
+            radial_v = (vx * dx + vy * dy + vz * dz) / dist
+        else:
+            radial_v = 0.0
+
+        # Add measurement noise to radial velocity
+        radial_v += random.gauss(0, 0.03)
+
+        snr = cfg.snr_base + random.gauss(0, cfg.snr_jitter)
+        snr = max(3.0, snr)  # floor at 3 dB
+
+        points.append(RawPoint(x=px, y=py, z=pz, velocity=radial_v, snr=snr))
+
+    return points
+
+
+def generate_ghost_points(
+    room_x_range: tuple[float, float],
+    room_y_range: tuple[float, float],
+    count: int = 1,
+) -> list[RawPoint]:
+    """Generate random ghost/artifact points anywhere in the room."""
+    ghosts: list[RawPoint] = []
+    for _ in range(count):
+        ghosts.append(RawPoint(
+            x=random.uniform(*room_x_range),
+            y=random.uniform(*room_y_range),
+            z=random.uniform(0.0, 2.5),
+            velocity=random.gauss(0, 0.3),
+            snr=random.uniform(3.0, 8.0),  # low SNR
+        ))
+    return ghosts
+=== Linux/radar_simulator/person_model.py ===
+"""
+person_model.py — Realistic human movement simulation.
+
+Each Person walks with smooth waypoint-based trajectories:
+  • picks a random destination inside the room
+  • walks toward it at a random speed (0.2–1.2 m/s)
+  • occasionally stops for a random duration
+  • occasionally changes direction mid-walk
+  • bounces off room walls
+  • supports fall simulation (z drops, stays low, optionally recovers)
+
+All units are in metres and seconds.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import Optional
+
+from .config import RoomConfig, PersonConfig
+
+
+class PersonState(Enum):
+    WALKING = auto()
+    STOPPED = auto()
+    FALLING = auto()
+    FALLEN = auto()
+    RECOVERING = auto()
+
+
+@dataclass
+class Person:
+    """One simulated person tracked by the radar."""
+
+    pid: int
+    x: float
+    y: float
+    z: float
+
+    # Velocity
+    vx: float = 0.0
+    vy: float = 0.0
+    vz: float = 0.0
+
+    # Acceleration (computed from velocity change)
+    ax: float = 0.0
+    ay: float = 0.0
+    az: float = 0.0
+
+    # Internal state
+    state: PersonState = PersonState.WALKING
+    speed: float = 0.6
+    heading: float = 0.0          # radians
+    standing_height: float = 1.5
+
+    # Waypoint the person is walking toward
+    _target_x: float = 0.0
+    _target_y: float = 0.0
+
+    # Timers
+    _stop_timer: float = 0.0
+    _fall_timer: float = 0.0
+    _fall_start_z: float = 0.0
+    _next_random_fall_timer: float = 0.0
+
+    # Previous velocity for acceleration calc
+    _prev_vx: float = 0.0
+    _prev_vy: float = 0.0
+    _prev_vz: float = 0.0
+
+    # Confidence (simulated tracker confidence)
+    confidence: float = 0.85
+
+    def __post_init__(self):
+        self._pick_new_waypoint_internal(0.2, 6.0, -3.0, 3.0)
+        # Random initial delay for the first fall
+        self._next_random_fall_timer = random.uniform(20.0, 30.0)
+
+    # ── Public API ──────────────────────────────────────
+
+    def step(self, dt: float, room: RoomConfig, cfg: PersonConfig):
+        """Advance the person simulation by dt seconds."""
+        old_vx, old_vy, old_vz = self.vx, self.vy, self.vz
+
+        if self.state == PersonState.WALKING:
+            self._step_walking(dt, room, cfg)
+        elif self.state == PersonState.STOPPED:
+            self._step_stopped(dt, room, cfg)
+        elif self.state == PersonState.FALLING:
+            self._step_falling(dt, cfg)
+        elif self.state == PersonState.FALLEN:
+            self._step_fallen(dt, cfg)
+        elif self.state == PersonState.RECOVERING:
+            self._step_recovering(dt, room, cfg)
+
+        # Compute acceleration from velocity change
+        self.ax = (self.vx - old_vx) / dt if dt > 0 else 0.0
+        self.ay = (self.vy - old_vy) / dt if dt > 0 else 0.0
+        self.az = (self.vz - old_vz) / dt if dt > 0 else 0.0
+
+    def trigger_fall(self):
+        """Begin a fall event."""
+        if self.state in (PersonState.FALLING, PersonState.FALLEN):
+            return
+        self.state = PersonState.FALLING
+        self._fall_timer = 0.0
+        self._fall_start_z = self.z
+
+    # ── Walking ─────────────────────────────────────────
+
+    def _step_walking(self, dt: float, room: RoomConfig, cfg: PersonConfig):
+        # Random fall?
+        self._next_random_fall_timer -= dt
+        if self._next_random_fall_timer <= 0:
+            self.trigger_fall()
+            self._next_random_fall_timer = random.uniform(20.0, 30.0)
+            return
+
+        # Random stop?
+        if random.random() < cfg.stop_probability:
+            self.state = PersonState.STOPPED
+            self._stop_timer = random.uniform(cfg.stop_duration_min, cfg.stop_duration_max)
+            self.vx = self.vy = self.vz = 0.0
+            return
+
+        # Random direction change?
+        if random.random() < cfg.direction_change_prob:
+            self._pick_new_waypoint(room)
+            self.speed = random.uniform(cfg.speed_min, cfg.speed_max)
+
+        # Move toward waypoint
+        dx = self._target_x - self.x
+        dy = self._target_y - self.y
+        dist = math.sqrt(dx * dx + dy * dy)
+
+        if dist < 0.15:
+            # Reached waypoint — pick a new one
+            self._pick_new_waypoint(room)
+            self.speed = random.uniform(cfg.speed_min, cfg.speed_max)
+            return
+
+        # Smoothly interpolate heading
+        desired_heading = math.atan2(dy, dx)
+        angle_diff = _wrap_angle(desired_heading - self.heading)
+        max_turn = 2.5 * dt   # max ~2.5 rad/s turning rate
+        self.heading += max(-max_turn, min(max_turn, angle_diff))
+
+        self.vx = self.speed * math.cos(self.heading)
+        self.vy = self.speed * math.sin(self.heading)
+        self.vz = 0.0
+
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+
+        # Small z sway while walking (simulates body bob)
+        sway = math.sin(self.x * 3.0 + self.y * 2.0) * 0.03
+        self.z = self.standing_height + sway
+
+        # Wall bounce
+        self._clamp_to_room(room)
+
+    def _step_stopped(self, dt: float, room: RoomConfig, cfg: PersonConfig):
+        # Random fall?
+        self._next_random_fall_timer -= dt
+        if self._next_random_fall_timer <= 0:
+            self.trigger_fall()
+            self._next_random_fall_timer = random.uniform(20.0, 30.0)
+            return
+
+        self._stop_timer -= dt
+        self.vx = self.vy = self.vz = 0.0
+        if self._stop_timer <= 0:
+            self.state = PersonState.WALKING
+            self._pick_new_waypoint(room)
+            self.speed = random.uniform(cfg.speed_min, cfg.speed_max)
+
+    # ── Fall ────────────────────────────────────────────
+
+    def _step_falling(self, dt: float, cfg: PersonConfig):
+        self._fall_timer += dt
+        progress = min(1.0, self._fall_timer / cfg.fall_duration)
+        # Ease-in curve (accelerating fall)
+        eased = progress * progress
+        self.z = self._fall_start_z + (cfg.fall_z_target - self._fall_start_z) * eased
+
+        # Velocity spike downward during fall
+        self.vz = -(self._fall_start_z - cfg.fall_z_target) * 2.0 * progress / cfg.fall_duration
+        # Small forward stumble
+        self.vx *= 0.9
+        self.vy *= 0.9
+        self.x += self.vx * dt
+        self.y += self.vy * dt
+
+        if progress >= 1.0:
+            self.state = PersonState.FALLEN
+            self._fall_timer = 0.0
+            self.z = cfg.fall_z_target
+            self.vx = self.vy = self.vz = 0.0
+
+    def _step_fallen(self, dt: float, cfg: PersonConfig):
+        """Stay on the ground."""
+        self._fall_timer += dt
+        self.vx = self.vy = self.vz = 0.0
+        # Small movement (shifting on floor)
+        self.x += random.gauss(0, 0.005)
+        self.y += random.gauss(0, 0.005)
+
+        if self._fall_timer >= cfg.fall_recovery_time:
+            self.state = PersonState.RECOVERING
+            self._fall_timer = 0.0
+
+    def _step_recovering(self, dt: float, room: RoomConfig, cfg: PersonConfig):
+        """Slowly get back up."""
+        self._fall_timer += dt
+        recovery_duration = 2.0  # seconds to stand back up
+        progress = min(1.0, self._fall_timer / recovery_duration)
+        self.z = cfg.fall_z_target + (self.standing_height - cfg.fall_z_target) * progress
+        self.vz = (self.standing_height - cfg.fall_z_target) / recovery_duration * 0.5
+        self.vx = self.vy = 0.0
+
+        if progress >= 1.0:
+            self.state = PersonState.WALKING
+            self.z = self.standing_height
+            self.vz = 0.0
+            self._pick_new_waypoint(room)
+            self.speed = random.uniform(cfg.speed_min * 0.5, cfg.speed_max * 0.5)
+
+    # ── Helpers ─────────────────────────────────────────
+
+    def _pick_new_waypoint(self, room: RoomConfig):
+        self._pick_new_waypoint_internal(room.x_min, room.x_max, room.y_min, room.y_max)
+
+    def _pick_new_waypoint_internal(self, xmin, xmax, ymin, ymax):
+        margin = 0.3
+        self._target_x = random.uniform(xmin + margin, xmax - margin)
+        self._target_y = random.uniform(ymin + margin, ymax - margin)
+
+    def _clamp_to_room(self, room: RoomConfig):
+        margin = 0.1
+        if self.x <= room.x_min + margin:
+            self.x = room.x_min + margin
+            self.vx = abs(self.vx) * 0.5
+            self._pick_new_waypoint(room)
+        elif self.x >= room.x_max - margin:
+            self.x = room.x_max - margin
+            self.vx = -abs(self.vx) * 0.5
+            self._pick_new_waypoint(room)
+
+        if self.y <= room.y_min + margin:
+            self.y = room.y_min + margin
+            self.vy = abs(self.vy) * 0.5
+            self._pick_new_waypoint(room)
+        elif self.y >= room.y_max - margin:
+            self.y = room.y_max - margin
+            self.vy = -abs(self.vy) * 0.5
+            self._pick_new_waypoint(room)
+
+
+def create_person(pid: int, room: RoomConfig, cfg: PersonConfig) -> Person:
+    """Factory: spawn a new Person at a random room position."""
+    x = random.uniform(room.x_min + 0.5, room.x_max - 0.5)
+    y = random.uniform(room.y_min + 0.5, room.y_max - 0.5)
+    z = random.uniform(cfg.standing_height_min, cfg.standing_height_max)
+    heading = random.uniform(0, 2 * math.pi)
+    speed = random.uniform(cfg.speed_min, cfg.speed_max)
+
+    return Person(
+        pid=pid, x=x, y=y, z=z,
+        standing_height=z,
+        heading=heading,
+        speed=speed,
+    )
+
+
+# ── Utilities ───────────────────────────────────────────────
+
+def _wrap_angle(a: float) -> float:
+    """Wrap angle to [-π, π]."""
+    while a > math.pi:
+        a -= 2 * math.pi
+    while a < -math.pi:
+        a += 2 * math.pi
+    return a
